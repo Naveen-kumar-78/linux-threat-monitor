@@ -30,7 +30,12 @@ AUTH_LOGS       = ["/var/log/auth.log", "/var/log/secure"]
 SYSLOG_LOGS     = ["/var/log/syslog", "/var/log/messages"]
 ALERT_JSON_PATH = "/var/log/smart_monitor_alerts.json"
 
-HOSTNAME = socket.gethostname()
+# HOSTNAME is loaded from .env (SERVER_NAME key) so every alert and email
+# clearly shows which server it came from. Falls back to socket.gethostname()
+# only if SERVER_NAME is not set in .env.
+_AUTO_HOSTNAME = socket.gethostname()
+HOSTNAME = _AUTO_HOSTNAME   # overwritten at startup and each cycle from env
+
 IST      = timezone(timedelta(hours=5, minutes=30), "IST")
 
 COOLDOWNS = {
@@ -1621,15 +1626,24 @@ def check_insider_evasion(env: dict):
 # Main loop
 # -----------------------------------------------------------------
 def main():
+    global HOSTNAME
     log("Smart Monitor v3.0 starting...")
     load_state()
     env = load_env(ENV_PATH)
+
+    # Set HOSTNAME from .env SERVER_NAME — your human-friendly server label.
+    # This name appears in every email subject, alert banner, and JSON record
+    # so you can instantly tell which server fired the alert.
+    HOSTNAME = env.get("SERVER_NAME", "").strip() or _AUTO_HOSTNAME
+    log(f"[INFO] Server identity: {HOSTNAME}  (set SERVER_NAME in .env to customise)")
 
     cycle = 0
     while True:
         cycle += 1
         log(f"--- Cycle {cycle} ---")
         env = load_env(ENV_PATH)
+        # Re-read SERVER_NAME every cycle so a rename takes effect without restart
+        HOSTNAME = env.get("SERVER_NAME", "").strip() or _AUTO_HOSTNAME
 
         load_cycle_lines()
 

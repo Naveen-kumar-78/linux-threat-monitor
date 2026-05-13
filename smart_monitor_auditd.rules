@@ -1,0 +1,102 @@
+## ═══════════════════════════════════════════════════════════════
+## Smart Monitor v3.0 — auditd Rules (Fixed for AWS / ARM64 / Ubuntu)
+## 
+## The original rules used syscall NAMES (unlink, unlinkat) which
+## some kernels/auditd versions don't support by name.
+## This version uses FILE WATCHES and EXECVE — works on any arch.
+##
+## Deploy:
+##   sudo cp smart_monitor_auditd.rules /etc/audit/rules.d/smart_monitor.rules
+##   sudo augenrules --load
+##   sudo systemctl restart auditd
+##   sudo auditctl -l   ← verify
+## ═══════════════════════════════════════════════════════════════
+
+## ── Buffer & backlog ────────────────────────────────────────────
+-b 8192
+--backlog_wait_time 60000
+
+## ── Reduce noise ────────────────────────────────────────────────
+-a never,exclude -F msgtype=CRYPTO_KEY_USER
+-a never,exclude -F msgtype=SERVICE_START
+-a never,exclude -F msgtype=SERVICE_STOP
+
+## ══════════════════════════════════════════════════════════════
+## 1. FILE DELETION — watch the rm/shred/rmdir BINARIES
+##    Works on x86_64, aarch64, ARM — no syscall name needed.
+##    Fires: EXECVE record with full args + SYSCALL with auid.
+## ══════════════════════════════════════════════════════════════
+-w /usr/bin/rm        -p x -k delete_events
+-w /bin/rm            -p x -k delete_events
+-w /usr/bin/shred     -p x -k delete_events
+-w /bin/shred         -p x -k delete_events
+-w /usr/bin/rmdir     -p x -k delete_events
+-w /bin/rmdir         -p x -k delete_events
+-w /usr/bin/truncate  -p x -k delete_events
+
+## ══════════════════════════════════════════════════════════════
+## 2. ALL USER COMMANDS — EXECVE for real humans (auid>=1000)
+##    This is the gold standard: captures every command run by
+##    a logged-in user (auid != 4294967295 means real login).
+##    auid>=1000 skips root and service accounts.
+## ══════════════════════════════════════════════════════════════
+-a always,exit -F arch=b64 -S execve -F auid>=1000 -F auid!=4294967295 -k exec_user
+-a always,exit -F arch=b32 -S execve -F auid>=1000 -F auid!=4294967295 -k exec_user
+
+## Also catch root user running commands after sudo/su
+## (auid will be the original user's UID, uid=0)
+-a always,exit -F arch=b64 -S execve -F uid=0 -F auid!=4294967295 -k exec_root
+-a always,exit -F arch=b32 -S execve -F uid=0 -F auid!=4294967295 -k exec_root
+
+## ══════════════════════════════════════════════════════════════
+## 3. PRIVILEGE ESCALATION (su / sudo / newgrp)
+## ══════════════════════════════════════════════════════════════
+-w /usr/bin/sudo     -p x -k priv_escalation
+-w /usr/bin/su       -p x -k priv_escalation
+-w /usr/bin/newgrp   -p x -k priv_escalation
+-w /usr/sbin/usermod -p x -k user_management
+-w /usr/sbin/useradd -p x -k user_management
+-w /usr/sbin/userdel -p x -k user_management
+-w /usr/sbin/groupadd -p x -k user_management
+-w /usr/sbin/groupdel -p x -k user_management
+
+## ══════════════════════════════════════════════════════════════
+## 4. SENSITIVE FILE WATCHES
+##    Any read/write/attr-change on these critical files
+## ══════════════════════════════════════════════════════════════
+-w /etc/passwd           -p rwa -k sensitive_files
+-w /etc/shadow           -p rwa -k sensitive_files
+-w /etc/sudoers          -p rwa -k sensitive_files
+-w /etc/sudoers.d/       -p rwa -k sensitive_files
+-w /etc/ssh/sshd_config  -p rwa -k sensitive_files
+-w /root/.ssh/           -p rwa -k sensitive_files
+-w /root/.bashrc         -p wa  -k sensitive_files
+-w /etc/crontab          -p wa  -k cron_changes
+-w /etc/cron.d/          -p wa  -k cron_changes
+-w /var/spool/cron/      -p wa  -k cron_changes
+-w /etc/hosts            -p wa  -k sensitive_files
+-w /etc/ld.so.preload    -p wa  -k ld_preload
+
+## ══════════════════════════════════════════════════════════════
+## 5. LOG FILE TAMPERING
+## ══════════════════════════════════════════════════════════════
+-w /var/log/auth.log   -p wa -k log_tampering
+-w /var/log/secure     -p wa -k log_tampering
+-w /var/log/audit/     -p wa -k log_tampering
+-w /var/log/syslog     -p wa -k log_tampering
+
+## ══════════════════════════════════════════════════════════════
+## 6. KERNEL MODULE LOADING (rootkit indicator)
+## ══════════════════════════════════════════════════════════════
+-w /sbin/insmod    -p x -k kernel_modules
+-w /sbin/rmmod     -p x -k kernel_modules
+-w /sbin/modprobe  -p x -k kernel_modules
+
+## ══════════════════════════════════════════════════════════════
+## 7. NETWORK RECON TOOLS
+## ══════════════════════════════════════════════════════════════
+-w /usr/bin/nmap    -p x -k network_recon
+-w /usr/bin/tcpdump -p x -k network_recon
+-w /usr/bin/nc      -p x -k network_tools
+-w /usr/bin/netcat  -p x -k network_tools
+-w /usr/bin/socat   -p x -k network_tools

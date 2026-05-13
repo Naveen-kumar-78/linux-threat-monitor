@@ -152,13 +152,33 @@ FILE_OFFSETS:       dict = {}
 SSH_FAILURES:       dict = defaultdict(list)
 USER_ROOT_SESSIONS: dict = defaultdict(list)
 USER_SUDO_COUNT:    dict = defaultdict(int)
-IDENTITY_CHAIN:     dict = {}
-SU_SESSION_START:   dict = {}
+IDENTITY_CHAIN:     dict = {}   # user -> datetime of last escalation
+SU_SESSION_START:   dict = {}   # user -> datetime root shell opened
 THREAT_SCORE_LOG:   dict = defaultdict(list)
 DELETION_EVENTS:    list = []
 LOG_SIZE_SNAPSHOT:  dict = {}
 _FILE_INODES:       dict = {}
 _LOG_SIZE_INITIALIZED: bool = False
+C2_SEEN_CONNECTIONS: dict = {}  # conn_key -> first_seen datetime
+DORMANT_ALERTED:    set  = set()  # accounts already alerted this run
+
+# Patterns ONLY for insider evasion / anti-forensic detection.
+# Dangerous commands (rm -rf, reverse shells, etc.) are caught by
+# check_auditd_commands which has better attribution via auditd.
+EVASION_PATTERNS = [
+    (r"history\s+-[cw]|unset\s+HISTFILE|HISTSIZE=0",
+     "Command history wiped/disabled",                 "HIGH"),
+    (r"export\s+HISTFILE=/dev/null",
+     "Bash history redirected to /dev/null",            "HIGH"),
+    (r">\s*/var/log/(?:auth|syslog|secure|audit)",
+     "Log file wiped with shell redirect",              "CRITICAL"),
+    (r"truncate\s+.*(?P<target>/var/log/\S*)",
+     "Log file truncated via truncate command",         "CRITICAL"),
+    (r"shred\s+.*(?P<target>/(?:etc|var|root)\S*)",
+     "Secure shred of critical system path",            "CRITICAL"),
+    (r"LD_PRELOAD\s*=",
+     "LD_PRELOAD library injection attempt",            "CRITICAL"),
+]
 
 
 def log(msg: str):
@@ -196,13 +216,24 @@ def load_env(path: str) -> dict:
 
 
 def load_state():
-    global FILE_OFFSETS, LOG_SIZE_SNAPSHOT
+    global FILE_OFFSETS, LOG_SIZE_SNAPSHOT, IDENTITY_CHAIN, SU_SESSION_START
     if os.path.exists(STATE_PATH):
         try:
             with open(STATE_PATH) as f:
                 data = json.load(f)
                 FILE_OFFSETS      = data.get("offsets", {})
                 LOG_SIZE_SNAPSHOT = data.get("log_sizes", {})
+                # Restore escalation chain (stored as ISO strings)
+                for user, ts_str in data.get("identity_chain", {}).items():
+                    try:
+                        IDENTITY_CHAIN[user] = datetime.fromisoformat(ts_str)
+                    except Exception:
+                        pass
+                for user, ts_str in data.get("su_sessions", {}).items():
+                    try:
+                        SU_SESSION_START[user] = datetime.fromisoformat(ts_str)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -211,7 +242,17 @@ def save_state():
     try:
         os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
         with open(STATE_PATH, "w") as f:
-            json.dump({"offsets": FILE_OFFSETS, "log_sizes": LOG_SIZE_SNAPSHOT}, f)
+            json.dump({
+                "offsets":        FILE_OFFSETS,
+                "log_sizes":      LOG_SIZE_SNAPSHOT,
+                # Persist escalation chain so attribution survives restarts
+                "identity_chain": {
+                    u: ts.isoformat() for u, ts in IDENTITY_CHAIN.items()
+                },
+                "su_sessions":    {
+                    u: ts.isoformat() for u, ts in SU_SESSION_START.items()
+                },
+            }, f, indent=2)
     except Exception:
         pass
 
@@ -246,8 +287,10 @@ def read_new_lines(logfile: str) -> list:
 
 
 def load_cycle_lines():
+    """Read new lines from all monitored log files including audit.log."""
     CYCLE_LINES.clear()
-    for logfile in list(set(AUTH_LOGS + SYSLOG_LOGS)):
+    all_logs = list(set(AUTH_LOGS + SYSLOG_LOGS + [AUDIT_LOG]))
+    for logfile in all_logs:
         CYCLE_LINES[logfile] = read_new_lines(logfile)
 
 
@@ -305,7 +348,7 @@ def compute_threat_score(user: str) -> float:
 
 
 def check_threat_scores(env: dict):
-    """Log-only threat score evaluation (no email spam)."""
+    """Evaluate accumulated threat scores; write to JSON audit log when threshold crossed."""
     now = datetime.now(IST)
     for user in list(THREAT_SCORE_LOG.keys()):
         score = compute_threat_score(user)
@@ -328,10 +371,30 @@ def check_threat_scores(env: dict):
             if cooldown_done and not score_jumped:
                 severity = "MEDIUM"
         THREAT_SCORE_LAST_ALERT[user] = (now, score)
-        prev_str = f" (was {last[1]:.0f})" if last else ""
-        hour = int(now.strftime("%H"))
-        log(f"[THREAT SCORE] User '{user}' score={score:.0f}{prev_str} "
-            f"severity={severity} off_hours={hour < 6 or hour > 22}")
+        prev_str  = f" (was {last[1]:.0f})" if last else ""
+        hour      = int(now.strftime("%H"))
+        off_hours = hour < 6 or hour > 22
+        detail = (
+            f"User '{user}' has accumulated a threat score of {score:.0f}{prev_str}. "
+            f"This means multiple suspicious events were detected for this user in a "
+            f"short period. Off-hours activity: {off_hours}."
+        )
+        log(f"[THREAT SCORE] {detail}")
+        # Write to JSON audit trail so threat score breaches are visible in the log
+        write_alert_json(
+            severity, "Accumulated Threat Score Breach", user,
+            detail,
+            env=env,
+            email_status="log_only",
+            extra_facts={
+                "User":             user,
+                "Threat score":     f"{score:.0f}",
+                "Previous score":   f"{last[1]:.0f}" if last else "0",
+                "Threshold":        str(THREAT_ALERT_THRESHOLD),
+                "Off-hours":        str(off_hours),
+                "Note":             "Score decays over time; high score means sustained activity",
+            }
+        )
 
 # -----------------------------------------------------------------
 # Lightweight HTML email builder (light theme, no scrolling needed)
@@ -511,10 +574,18 @@ def write_alert_json(severity, alert_type, user, detail,
         dir_path = os.path.dirname(path)
         if dir_path:
             os.makedirs(dir_path, exist_ok=True)
+        # Open in append mode
         with open(path, "a") as f:
-            # Pretty-print + blank-line separator for readability
             f.write(json.dumps(record, indent=2, ensure_ascii=False))
             f.write("\n\n")
+        # Enforce root-only permissions: chmod 600 + chown root:root
+        # Only root (the process owner) can read this file.
+        # sudo users cannot read it without switching to root first.
+        os.chmod(path, 0o600)
+        try:
+            os.chown(path, 0, 0)   # uid=0 (root), gid=0 (root)
+        except AttributeError:
+            pass   # Windows (dev machine) -- skip chown
     except Exception as exc:
         log(f"[WARN] Could not write alert JSON: {exc}")
 
@@ -626,9 +697,73 @@ def trigger_alert(severity, alert_type, user, detail, env,
     )
 
 # -----------------------------------------------------------------
+# Escalation context helpers
+# -----------------------------------------------------------------
+def _active_root_actor() -> tuple[str, str]:
+    """
+    Return (original_user, how_they_escalated) for whoever currently
+    holds an active root session in IDENTITY_CHAIN / SU_SESSION_START.
+
+    'How' is one of:
+      'su/sudo shell'  -- opened a full root shell (su -, sudo su)
+      'sudo'           -- ran individual sudo commands (no full shell)
+      ''               -- no known escalation (direct root login)
+
+    Returns ('root', '') if no escalated user is tracked.
+    """
+    now     = datetime.now(IST)
+    cutoff  = timedelta(hours=2)   # forget escalations older than 2h
+
+    # Prefer full su/sudo-shell sessions (strongest signal)
+    for user, started_at in SU_SESSION_START.items():
+        if (now - started_at) <= cutoff:
+            return user, "su/sudo shell"
+
+    # Fall back to identity chain (individual sudo commands)
+    best_user, best_ts = None, None
+    for user, ts in IDENTITY_CHAIN.items():
+        if (now - ts) <= cutoff:
+            if best_ts is None or ts > best_ts:
+                best_user, best_ts = user, ts
+    if best_user:
+        return best_user, "sudo"
+
+    return "root", ""
+
+
+def _escalation_context(user: str, how: str, action: str = "") -> str:
+    """
+    Build a plain-English one-liner explaining who did what and how
+    they got elevated privileges.
+
+    Examples
+    --------
+    _escalation_context("ubuntu", "su/sudo shell", "changed naveen's password")
+    → "ubuntu switched to root via su/sudo shell and changed naveen's password"
+
+    _escalation_context("naveen", "sudo", "deleted /var/log/auth.log")
+    → "naveen used sudo to delete /var/log/auth.log"
+
+    _escalation_context("root", "", "modified /etc/shadow")
+    → "root (direct login) modified /etc/shadow"
+    """
+    if how == "su/sudo shell":
+        verb = "switched to root via su/sudo shell"
+    elif how == "sudo":
+        verb = "used sudo"
+    else:
+        verb = "(direct root login)"
+
+    if action:
+        return f"{user} {verb} and {action}"
+    return f"{user} {verb}"
+
+
+# -----------------------------------------------------------------
 # User attribution: resolve the ORIGINAL login user
 # -----------------------------------------------------------------
 def _resolve_audit_user(rec: dict) -> str:
+
     """
     Return best human-readable attribution string.
     - auid=4294967295 means unset (daemon/kernel) -- fall back to uid.
@@ -660,16 +795,26 @@ def _resolve_audit_user(rec: dict) -> str:
 
 
 # -----------------------------------------------------------------
-# Auditd record parser
+# Auditd record parser  (uses cycle lines -- no full file re-read)
 # -----------------------------------------------------------------
 def _build_audit_records(logfile: str) -> list:
     """
-    Parse value pairs from auditd EXECVE records.
-    Group consecutive records by serial number into compound events.
+    Parse auditd EXECVE records from the NEW lines read this cycle.
+    Uses CYCLE_LINES (offset-tracked) so old events are never re-processed.
+    Falls back to reading the last 4 KB of the file on first run.
     Returns a list of dicts: uid, auid, euid, pid, ppid, exe, cmd, args.
     """
-    if not os.path.exists(logfile):
-        return []
+    lines = CYCLE_LINES.get(logfile)
+    if lines is None:
+        # First cycle or file not yet in CYCLE_LINES -- read tail only
+        if not os.path.exists(logfile):
+            return []
+        try:
+            with open(logfile, "rb") as f:
+                f.seek(max(0, os.path.getsize(logfile) - 4096))
+                lines = f.read().decode(errors="replace").splitlines()
+        except Exception:
+            return []
 
     raw_blocks: dict = defaultdict(dict)
     pattern = re.compile(
@@ -677,33 +822,27 @@ def _build_audit_records(logfile: str) -> list:
     )
     kv_re = re.compile(r'(\w+)=(?:"([^"]*)"|(\S+))')
 
-    try:
-        with open(logfile, errors="replace") as f:
-            for line in f:
-                m = pattern.search(line)
-                if not m:
-                    continue
-                serial, rec_type = m.group(1), m.group(2)
-                kv = {k: (v1 or v2) for k, v1, v2 in kv_re.findall(line)}
-                block = raw_blocks[serial]
-                block.update(kv)
-                if rec_type == "EXECVE":
-                    # reassemble argv
-                    argc = int(kv.get("argc", 0))
-                    args = []
-                    for i in range(argc):
-                        arg = kv.get(f"a{i}", "")
-                        # hex-decode if needed
-                        if re.fullmatch(r"[0-9A-Fa-f]+", arg) and len(arg) % 2 == 0:
-                            try:
-                                arg = bytes.fromhex(arg).decode(errors="replace")
-                            except Exception:
-                                pass
-                        args.append(arg)
-                    block["cmd"]  = " ".join(args) if args else block.get("cmd", "")
-                    block["args"] = args
-    except Exception:
-        return []
+    for line in lines:
+        m = pattern.search(line)
+        if not m:
+            continue
+        serial, rec_type = m.group(1), m.group(2)
+        kv = {k: (v1 or v2) for k, v1, v2 in kv_re.findall(line)}
+        block = raw_blocks[serial]
+        block.update(kv)
+        if rec_type == "EXECVE":
+            argc = int(kv.get("argc", 0))
+            args = []
+            for i in range(argc):
+                arg = kv.get(f"a{i}", "")
+                if re.fullmatch(r"[0-9A-Fa-f]+", arg) and len(arg) % 2 == 0:
+                    try:
+                        arg = bytes.fromhex(arg).decode(errors="replace")
+                    except Exception:
+                        pass
+                args.append(arg)
+            block["cmd"]  = " ".join(args) if args else block.get("cmd", "")
+            block["args"] = args
 
     results = []
     for block in raw_blocks.values():
@@ -1033,14 +1172,30 @@ def check_proc_scanner(env: dict):
         for pattern, desc, severity in DANGEROUS_PATTERNS:
             if re.search(pattern, cmd_line, re.IGNORECASE):
                 user = parts[0]
+                # Check if this process owner has an active root session
+                proc_user = parts[0]
+                actor, how = _active_root_actor()
+                if how and actor != proc_user:
+                    # The process is running under a user who escalated
+                    narrative = (
+                        f"{actor} {('switched to root via ' + how) if how else '(direct root)'} "
+                        f"and a suspicious process is running under '{proc_user}': {cmd_line[:150]}"
+                    )
+                else:
+                    narrative = (
+                        f"User '{proc_user}' has a suspicious process running: {cmd_line[:150]}"
+                    )
                 trigger_alert(
-                    severity, f"Suspicious Process: {desc}", user,
-                    f"Running process matched '{desc}': {cmd_line[:200]}",
+                    severity, f"Suspicious Process: {desc}", proc_user,
+                    narrative,
                     env,
                     extra_facts={
-                        "User":    user,
-                        "PID":     parts[1],
-                        "Command": cmd_line[:200],
+                        "User":             proc_user,
+                        "Escalated from":   actor if how else "n/a",
+                        "How":              how or "direct",
+                        "PID":              parts[1],
+                        "Command":          cmd_line[:200],
+                        "Matched pattern":  desc,
                     }
                 )
                 break
@@ -1082,16 +1237,25 @@ def check_proc_scanner(env: dict):
                         continue
 
                     user = uid_to_name(str(real_uid))
+                    # Did this user escalate to get here?
+                    actor, how = _active_root_actor()
+                    if how and actor == user:
+                        how_str = f"{user} escalated via {how} — process is now running as effective root"
+                    else:
+                        how_str = f"{user} (real UID) has a process running as effective root without a tracked sudo/su session — possible SUID exploit or privilege escalation"
+
                     trigger_alert(
                         "HIGH", "Root Process From Non-Root User", user,
-                        f"PID {pid} is running as effective root but real user is '{user}'\n"
-                        f"Command: {cmd_str}",
+                        f"{how_str}\nPID {pid} command: {cmd_str}",
                         env,
                         extra_facts={
-                            "PID":       pid,
-                            "Real user": user,
-                            "Exe":       exe_path or "?",
-                            "Command":   cmd_str,
+                            "PID":           pid,
+                            "Real user":     user,
+                            "Real UID":      str(real_uid),
+                            "Effective UID": "0 (root)",
+                            "Exe":           exe_path or "?",
+                            "Command":       cmd_str,
+                            "Escalation":    how or "none tracked — suspicious",
                         }
                     )
             except Exception:
@@ -1118,22 +1282,30 @@ def check_dormant_accounts(env: dict):
             username = parts[0]
             if parts[1].lower() in ("never", "**never", "**never**"):
                 continue
+            # Skip accounts already alerted this run (no re-alert every 2h)
+            if username in DORMANT_ALERTED:
+                continue
             try:
-                # typical format: Mon Jan 01 00:00:00 +0530 2024
-                date_str = " ".join(parts[1:6])
+                date_str   = " ".join(parts[1:6])
                 last_login = datetime.strptime(date_str, "%a %b %d %H:%M:%S %z %Y")
-                age_days = (now.replace(tzinfo=None) -
-                            last_login.replace(tzinfo=None)).days
+                age_days   = (now.replace(tzinfo=None) -
+                              last_login.replace(tzinfo=None)).days
                 if age_days > 90:
+                    # Try to get login source from 'last' command
+                    src_ip = run(f"last -n 1 {username} 2>/dev/null | awk 'NR==1{{print $3}}'")
+                    DORMANT_ALERTED.add(username)   # never re-alert same account
                     trigger_alert(
-                        "HIGH", "Dormant Account Activity", username,
-                        f"Account '{username}' had not logged in for {age_days} days "
-                        f"but just appeared in lastlog",
+                        "HIGH", "Dormant Account Logged In", username,
+                        f"Account '{username}' was dormant for {age_days} days and "
+                        f"just logged in"
+                        + (f" from {src_ip}" if src_ip and src_ip != username else ""),
                         env,
                         extra_facts={
-                            "User":        username,
+                            "User":         username,
                             "Days dormant": str(age_days),
-                            "Last login":  date_str,
+                            "Last login":   date_str,
+                            "Login source": src_ip or "unknown",
+                            "Risk":         "Dormant accounts are often used by ex-employees or attackers",
                         }
                     )
             except Exception:
@@ -1160,12 +1332,21 @@ def check_kernel_modules(env: dict):
         return
 
     new_mods = current_mods - prev_mods
+    if new_mods:
+        actor, how = _active_root_actor()
     for mod in new_mods:
+        action  = f"loaded kernel module '{mod}' -- this is a rootkit persistence technique"
+        context = _escalation_context(actor, how, action)
         trigger_alert(
-            "CRITICAL", "Kernel Module Loaded", "root",
-            f"New kernel module loaded: {mod}",
+            "CRITICAL", "Kernel Module Loaded", actor,
+            context,
             env,
-            extra_facts={"Module": mod}
+            extra_facts={
+                "Who":    actor,
+                "How":    how or "direct root",
+                "Module": mod,
+                "Risk":   "Rootkits use kernel modules for persistent, undetectable access",
+            }
         )
     ALERTS_SENT[prev_key + "_data"] = ",".join(current_mods)
 
@@ -1190,11 +1371,50 @@ def check_network_connections(env: dict):
             port, proc = int(m.group(1)), m.group(2)
 
         if port in C2_PORTS:
+            # ── Dedup: only alert once per unique connection ────────
+            conn_key = f"{port}:{proc}:{line.strip()[-60:]}"
+            now      = datetime.now(IST)
+            if conn_key in C2_SEEN_CONNECTIONS:
+                # Re-alert after 30 min if connection is still alive
+                if (now - C2_SEEN_CONNECTIONS[conn_key]) < timedelta(minutes=30):
+                    continue
+            C2_SEEN_CONNECTIONS[conn_key] = now
+
+            # Try to resolve the real user owning the process via /proc
+            proc_user = "unknown"
+            pid_match = re.search(r"pid=(\d+)", line)
+            if pid_match:
+                try:
+                    status_txt = open(f"/proc/{pid_match.group(1)}/status",
+                                      errors="replace").read()
+                    uid_m = re.search(r"^Uid:\s+(\d+)", status_txt, re.M)
+                    if uid_m:
+                        proc_user = uid_to_name(uid_m.group(1))
+                except Exception:
+                    pass
+
+            actor, how = _active_root_actor()
+            if how and (proc_user == "root" or proc_user == actor):
+                who_narrative = _escalation_context(actor, how)
+            elif proc_user not in ("unknown", "root"):
+                who_narrative = f"user '{proc_user}'"
+            else:
+                who_narrative = "an unknown/root process"
+
             trigger_alert(
-                "CRITICAL", "C2/Reverse-Shell Port Connection", proc,
-                f"Active connection on known C2 port {port} by process '{proc}'\n{line.strip()}",
+                "CRITICAL", "C2/Reverse-Shell Port Connection", proc_user,
+                f"{who_narrative} has an active outbound connection on "
+                f"known C2/reverse-shell port {port} via process '{proc}'",
                 env,
-                extra_facts={"Port": str(port), "Process": proc}
+                extra_facts={
+                    "Process user":   proc_user,
+                    "Escalated from": actor if how else "n/a",
+                    "How":            how or "direct",
+                    "Port":           str(port),
+                    "Process":        proc,
+                    "Risk":           "Port commonly used for reverse shells and C2 beacons",
+                    "Raw connection": line.strip()[:200],
+                }
             )
 
 
@@ -1220,14 +1440,23 @@ def check_log_tampering(env: dict):
         _LOG_SIZE_INITIALIZED = True
         return
 
+    actor, how = _active_root_actor()
+
     for path in critical_logs:
         if not os.path.exists(path):
             if path in LOG_SIZE_SNAPSHOT and LOG_SIZE_SNAPSHOT[path] > 0:
+                action  = f"deleted log file: {path}"
+                context = _escalation_context(actor, how, action)
                 trigger_alert(
-                    "CRITICAL", "Log File Deleted", "root",
-                    f"Log file deleted or missing: {path}",
+                    "CRITICAL", "Log File Deleted", actor,
+                    context,
                     env,
-                    extra_facts={"File": path, "Previous size": str(LOG_SIZE_SNAPSHOT[path])}
+                    extra_facts={
+                        "Who":           actor,
+                        "How":           how or "direct root",
+                        "File":          path,
+                        "Previous size": str(LOG_SIZE_SNAPSHOT[path]),
+                    }
                 )
             LOG_SIZE_SNAPSHOT[path] = 0
             continue
@@ -1240,23 +1469,25 @@ def check_log_tampering(env: dict):
             continue
 
         if current_size < prev_size:
-            # Check if this is a logrotate event (backup .1 file appeared recently)
             backup = path + ".1"
             is_rotation = False
             if os.path.exists(backup):
                 backup_age = now.timestamp() - os.path.getmtime(backup)
-                is_rotation = backup_age < 120  # backup file appeared within 2 min
+                is_rotation = backup_age < 120
             if not is_rotation:
+                action  = f"truncated log file: {path}  (was {prev_size} bytes, now {current_size} bytes)"
+                context = _escalation_context(actor, how, action)
                 trigger_alert(
-                    "CRITICAL", "Log File Truncated/Shrunk", "root",
-                    f"Log file shrank without rotation: {path}\n"
-                    f"Was {prev_size} bytes, now {current_size} bytes",
+                    "CRITICAL", "Log File Truncated/Shrunk", actor,
+                    context,
                     env,
                     extra_facts={
-                        "File":     path,
-                        "Was":      f"{prev_size} bytes",
-                        "Now":      f"{current_size} bytes",
-                        "Delta":    f"-{prev_size - current_size} bytes",
+                        "Who":   actor,
+                        "How":   how or "direct root",
+                        "File":  path,
+                        "Was":   f"{prev_size} bytes",
+                        "Now":   f"{current_size} bytes",
+                        "Delta": f"-{prev_size - current_size} bytes",
                     }
                 )
         LOG_SIZE_SNAPSHOT[path] = current_size
@@ -1267,9 +1498,9 @@ def check_log_tampering(env: dict):
 # -----------------------------------------------------------------
 def check_file_integrity(env: dict):
     """
-    Compare mtime of critical files against known-good timestamps.
-    Detects modifications to /etc/passwd, /etc/shadow, /etc/sudoers,
-    SSH keys, /etc/cron.d, etc.
+    Detect modifications to critical system files using SHA256 hashes.
+    SHA256 is tamper-proof -- an attacker cannot fool this by restoring
+    the original mtime with 'touch -t' (which would defeat mtime-only checks).
     """
     watch_files = [
         "/etc/passwd", "/etc/shadow", "/etc/sudoers", "/etc/hosts",
@@ -1277,28 +1508,62 @@ def check_file_integrity(env: dict):
         "/root/.ssh/authorized_keys", "/etc/ssh/sshd_config",
         "/etc/ld.so.preload", "/etc/ld.so.conf",
     ]
-    state_key = "_file_mtime"
-    prev_mtimes = ALERTS_SENT.get(state_key, {})
-    if not isinstance(prev_mtimes, dict):
-        prev_mtimes = {}
+    state_key   = "_file_sha256"
+    prev_hashes = ALERTS_SENT.get(state_key, {})
+    if not isinstance(prev_hashes, dict):
+        prev_hashes = {}
+
+    actor, how = _active_root_actor()
+
+    _file_label = {
+        "/etc/passwd":                "the user account database",
+        "/etc/shadow":                "the password hash database (shadow file)",
+        "/etc/sudoers":               "the sudoers privilege config",
+        "/etc/hosts":                 "the hosts file",
+        "/etc/crontab":               "the system crontab",
+        "/etc/cron.d":                "a cron job directory",
+        "/root/.bashrc":              "root's shell config (.bashrc)",
+        "/root/.profile":             "root's shell profile",
+        "/root/.ssh/authorized_keys": "root's SSH authorized_keys",
+        "/etc/ssh/sshd_config":       "the SSH daemon config",
+        "/etc/ld.so.preload":         "the LD_PRELOAD injection file (rootkit risk)",
+        "/etc/ld.so.conf":            "the dynamic linker config",
+    }
 
     for fpath in watch_files:
         if not os.path.exists(fpath):
             continue
         try:
-            mtime = os.path.getmtime(fpath)
+            # Compute SHA256 of the file content
+            h = hashlib.sha256()
+            with open(fpath, "rb") as fh:
+                for chunk in iter(lambda: fh.read(8192), b""):
+                    h.update(chunk)
+            current_hash = h.hexdigest()
         except Exception:
             continue
-        if fpath in prev_mtimes and prev_mtimes[fpath] != mtime:
-            trigger_alert(
-                "CRITICAL", "Critical File Modified", "root",
-                f"File modification detected: {fpath}",
-                env,
-                extra_facts={"File": fpath}
-            )
-        prev_mtimes[fpath] = mtime
 
-    ALERTS_SENT[state_key] = prev_mtimes
+        if fpath in prev_hashes and prev_hashes[fpath] != current_hash:
+            label   = _file_label.get(fpath, fpath)
+            action  = f"modified {label} ({fpath})"
+            context = _escalation_context(actor, how, action)
+            trigger_alert(
+                "CRITICAL", "Critical File Modified", actor,
+                context,
+                env,
+                extra_facts={
+                    "Who":           actor,
+                    "How":           how or "direct root",
+                    "File":          fpath,
+                    "What":          label,
+                    "Detection":     "SHA256 content hash changed (tamper-proof)",
+                    "Previous hash": prev_hashes[fpath][:16] + "...",
+                    "Current hash":  current_hash[:16] + "...",
+                }
+            )
+        prev_hashes[fpath] = current_hash
+
+    ALERTS_SENT[state_key] = prev_hashes
 
 
 # -----------------------------------------------------------------
@@ -1306,21 +1571,48 @@ def check_file_integrity(env: dict):
 # -----------------------------------------------------------------
 def check_insider_evasion(env: dict):
     """
-    Detect evidence-destruction / insider-evasion via syslog/auth.log:
-    - history wipe (history -c / HISTFILE=/dev/null)
-    - log deletion patterns
+    Detect ONLY anti-forensic / evidence-destruction events from syslog/auth.log.
+    Uses EVASION_PATTERNS (not DANGEROUS_PATTERNS) to avoid duplicating alerts
+    that check_auditd_commands already raises with better attribution.
+
+    Catches: history wipes, HISTFILE redirects, log truncation via shell
+    redirect, shred of critical paths, LD_PRELOAD injection.
     """
     lines = get_cycle_lines(AUTH_LOGS + SYSLOG_LOGS)
     for line in lines:
-        for pattern, desc, severity in DANGEROUS_PATTERNS:
-            if re.search(pattern, line, re.IGNORECASE):
-                m_user = re.search(r"for\s+(\S+)", line)
-                user   = m_user.group(1) if m_user else "unknown"
+        for pat, desc, severity in EVASION_PATTERNS:
+            if re.search(pat, line, re.IGNORECASE):
+
+                # Extract user -- try sudo format first
+                m_sudo_user = re.search(r"sudo:\s+(\S+)\s*:", line)
+                m_for_user  = re.search(r"for\s+(\S+)", line)
+                if m_sudo_user:
+                    user = m_sudo_user.group(1).strip()
+                elif m_for_user:
+                    user = m_for_user.group(1).strip()
+                else:
+                    user = "unknown"
+
+                m_cmd       = re.search(r"COMMAND=(.+)$", line.strip())
+                command_str = m_cmd.group(1).strip() if m_cmd else line.strip()[:200]
+
+                detail = (
+                    f"User '{user}' performed anti-forensic action via sudo: {command_str}"
+                    if (m_sudo_user and m_cmd)
+                    else f"Anti-forensic pattern detected in system log: {line.strip()[:200]}"
+                )
+
                 trigger_alert(
-                    severity, f"Insider Evasion: {desc}", user,
-                    f"Detected in system log: {line.strip()[:200]}",
+                    severity, f"Anti-Forensic Activity: {desc}", user,
+                    detail,
                     env,
-                    context_lines=[line.strip()]
+                    context_lines=[line.strip()],
+                    extra_facts={
+                        "User":    user,
+                        "Command": command_str,
+                        "Matched": desc,
+                        "Risk":    "Attacker is attempting to erase evidence of their actions",
+                    }
                 )
                 break
 

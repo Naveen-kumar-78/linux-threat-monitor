@@ -433,28 +433,88 @@ def build_html_email(severity, alert_type, user, detail,
 
 
 # -----------------------------------------------------------------
-# JSON alert log writer
+# JSON alert log writer  (human-readable format)
 # -----------------------------------------------------------------
 def write_alert_json(severity, alert_type, user, detail,
-                     extra_facts=None, env=None):
-    """Append one alert record (JSON line) to the alert log file."""
+                     extra_facts=None, env=None, email_status="unknown",
+                     email_recipients=None):
+    """
+    Append one alert record to the JSON alert log.
+
+    Each record is a self-contained, human-readable JSON object that
+    includes:
+      - A plain-English 'human_summary' field
+      - A 'notification' block describing whether an e-mail was sent
+      - All original technical fields for forensic correlation
+
+    Records are separated by a blank line so the file is easy to read
+    with a text editor (not just a JSON parser).
+    """
     path = (env or {}).get("ALERT_JSON_PATH", ALERT_JSON_PATH)
+    now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+
+    # ── Plain-English summary ────────────────────────────────────────
+    sev_label = {
+        "CRITICAL": "CRITICAL  ⛔",
+        "HIGH":     "HIGH      ⚠️",
+        "MEDIUM":   "MEDIUM    🔶",
+        "LOW":      "LOW       ℹ️",
+    }.get(severity, severity)
+
+    human_summary = (
+        f"{sev_label} security event detected on '{HOSTNAME}'.\n"
+        f"  Alert  : {alert_type}\n"
+        f"  User   : {user}\n"
+        f"  Time   : {now_str}\n"
+        f"  Detail : {detail[:300]}"
+    )
+
+    # ── Notification block ───────────────────────────────────────────
+    notification: dict = {"email_status": email_status}
+    if email_recipients:
+        notification["email_recipients"] = email_recipients
+    if email_status == "disabled":
+        notification["note"] = (
+            "MAIL_ENABLED is set to false in .env  --  "
+            "alert is recorded here only; no email was sent."
+        )
+    elif email_status == "sent":
+        notification["note"] = (
+            "Email alert successfully dispatched via AWS SES."
+        )
+    elif email_status == "skipped_no_credentials":
+        notification["note"] = (
+            "Email could NOT be sent -- AWS/SES credentials are "
+            "missing or incomplete in .env."
+        )
+    elif email_status == "send_failed":
+        notification["note"] = (
+            "Email send attempted but AWS SES returned an error. "
+            "Check smart_monitor.log for details."
+        )
+
+    # ── Full record ──────────────────────────────────────────────────
     record = {
-        "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-        "hostname":  HOSTNAME,
-        "severity":  severity,
-        "alert":     alert_type,
-        "user":      user,
-        "detail":    detail[:500],
+        "human_summary": human_summary,
+        "timestamp":     now_str,
+        "hostname":      HOSTNAME,
+        "severity":      severity,
+        "alert_type":    alert_type,
+        "affected_user": user,
+        "detail":        detail[:500],
+        "notification":  notification,
     }
     if extra_facts:
-        record["facts"] = {k: str(v)[:200] for k, v in extra_facts.items()}
+        record["extra_facts"] = {k: str(v)[:200] for k, v in extra_facts.items()}
+
     try:
         dir_path = os.path.dirname(path)
         if dir_path:
             os.makedirs(dir_path, exist_ok=True)
         with open(path, "a") as f:
-            f.write(json.dumps(record) + "\n")
+            # Pretty-print + blank-line separator for readability
+            f.write(json.dumps(record, indent=2, ensure_ascii=False))
+            f.write("\n\n")
     except Exception as exc:
         log(f"[WARN] Could not write alert JSON: {exc}")
 
@@ -521,20 +581,49 @@ def trigger_alert(severity, alert_type, user, detail, env,
         return
 
     record_threat_event(user, severity)
-    log(f"[{severity}] {alert_type} | user={user} | {detail[:80]}")
 
-    # Always write to JSON audit log
-    write_alert_json(severity, alert_type, user, detail, extra_facts, env)
+    now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    separator = "=" * 72
 
-    # Respect MAIL_ENABLED flag
+    # ── Human-readable banner in the .log file (always written) ─────
+    log(separator)
+    log(f"  SECURITY ALERT  [{severity}]")
+    log(f"  Alert Type : {alert_type}")
+    log(f"  User       : {user}")
+    log(f"  Host       : {HOSTNAME}")
+    log(f"  Time       : {now_str}")
+    log(f"  Detail     : {detail[:120]}")
+    if extra_facts:
+        for k, v in list(extra_facts.items())[:6]:
+            log(f"  {k:<12}: {str(v)[:100]}")
+    log(separator)
+
+    # ── Determine email status & dispatch ───────────────────────────
     mail_enabled = env.get("MAIL_ENABLED", "true").strip().lower()
-    if mail_enabled not in ("true", "1", "yes"):
-        log("[INFO] MAIL_ENABLED=false -- alert logged only, no email sent")
-        return
+    rcpt_str     = env.get("SES_RECIPIENT_EMAILS", "")
+    recipients   = [e.strip() for e in rcpt_str.split(",") if e.strip()]
 
-    html = build_html_email(severity, alert_type, user, detail,
-                             context_lines, extra_facts)
-    send_alert_email(f"{alert_type} ({user})", html, env)
+    if mail_enabled not in ("true", "1", "yes"):
+        email_status = "disabled"
+        log(f"[INFO] MAIL_ENABLED=false  --  alert logged only, no email sent")
+    elif not all([env.get("AWS_ACCESS_KEY_ID"), env.get("AWS_SECRET_ACCESS_KEY"),
+                  env.get("SES_SENDER_EMAIL"), rcpt_str]):
+        email_status = "skipped_no_credentials"
+        log("[WARN] Email skipped -- AWS/SES credentials incomplete in .env")
+    else:
+        html = build_html_email(severity, alert_type, user, detail,
+                                 context_lines, extra_facts)
+        ok   = send_alert_email(f"{alert_type} ({user})", html, env)
+        email_status = "sent" if ok else "send_failed"
+
+    # ── Always write enriched human-readable JSON audit record ───────
+    write_alert_json(
+        severity, alert_type, user, detail,
+        extra_facts=extra_facts,
+        env=env,
+        email_status=email_status,
+        email_recipients=recipients or None,
+    )
 
 # -----------------------------------------------------------------
 # User attribution: resolve the ORIGINAL login user

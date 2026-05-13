@@ -887,6 +887,45 @@ def check_user_group_changes(env: dict):
 
 
 # -----------------------------------------------------------------
+# SUID process whitelist
+# These binaries legitimately run as effective-root from non-root users
+# because they carry the SUID bit. They are NOT security threats.
+# -----------------------------------------------------------------
+SUID_EXE_WHITELIST = re.compile(
+    r"""(?x)
+    fusermount3?          # FUSE filesystem mounter (GNOME portal, etc.)
+    |/usr/bin/mount       # Standard mount
+    |/usr/bin/umount      # Standard umount
+    |/usr/bin/sudo        # sudo itself
+    |/usr/bin/su\b        # su command
+    |/usr/bin/newgrp      # newgrp group switch
+    |/usr/bin/passwd      # passwd (own password change)
+    |/usr/bin/chfn        # Change finger info
+    |/usr/bin/chsh        # Change login shell
+    |/usr/bin/gpasswd     # Group password admin
+    |/usr/bin/expiry      # Password expiry check
+    |/usr/sbin/pam_      # PAM helpers
+    |/usr/lib/policykit   # Polkit
+    |/usr/lib/polkit      # Polkit agent
+    |/usr/bin/pkexec      # Polkit exec helper
+    |gnome-keyring-daemon # GNOME keyring
+    |/usr/lib/gnome       # GNOME components
+    |/usr/lib/xorg        # Xorg helpers
+    |Xorg\.wrap           # Xorg wrapper
+    |/usr/sbin/unix_chkpwd  # PAM Unix password checker
+    |/usr/bin/ksu         # Kerberos su
+    |/usr/bin/ssh-agent   # SSH agent
+    |at-spi               # Accessibility
+    |dbus-daemon          # D-Bus
+    |/usr/lib/dbus        # D-Bus helpers
+    |/usr/bin/crontab     # crontab editor
+    |ping\b|/bin/ping     # ping (SUID on some distros)
+    |/usr/bin/traceroute  # traceroute
+    |snap-confine         # Snap confinement
+    """, re.IGNORECASE)
+
+
+# -----------------------------------------------------------------
 # Check: suspicious processes in /proc
 # -----------------------------------------------------------------
 def check_proc_scanner(env: dict):
@@ -938,6 +977,21 @@ def check_proc_scanner(env: dict):
                         cmd_str   = cmd_bytes.replace(b"\x00", b" ").decode(errors="replace")[:200]
                     except Exception:
                         cmd_str = "?"
+
+                    # Skip whitelisted SUID binaries -- legitimate setuid helpers
+                    exe_path = ""
+                    try:
+                        exe_path = os.readlink(f"/proc/{pid}/exe")
+                    except Exception:
+                        pass
+                    check_str = exe_path or cmd_str
+                    if SUID_EXE_WHITELIST.search(check_str):
+                        continue
+
+                    # Also skip system/service accounts (uid < 1000)
+                    if real_uid < 1000:
+                        continue
+
                     user = uid_to_name(str(real_uid))
                     trigger_alert(
                         "HIGH", "Root Process From Non-Root User", user,
@@ -947,6 +1001,7 @@ def check_proc_scanner(env: dict):
                         extra_facts={
                             "PID":       pid,
                             "Real user": user,
+                            "Exe":       exe_path or "?",
                             "Command":   cmd_str,
                         }
                     )

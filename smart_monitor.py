@@ -326,7 +326,13 @@ def get_cycle_lines(logfiles: list) -> list:
 
 
 def _alert_key(category: str, detail: str = "") -> str:
-    return hashlib.sha1(category.encode()).hexdigest()[:16]
+    """
+    Build a dedup key for should_alert().
+    Including 'detail' means different targets/files by the same user
+    get distinct keys — e.g. deleting file A and file B are two separate
+    alert buckets, not one.  Callers pass the target/resource as detail.
+    """
+    return hashlib.sha1((category + detail).encode()).hexdigest()[:16]
 
 
 def should_alert(key: str, severity: str) -> bool:
@@ -411,29 +417,55 @@ def check_threat_scores(env: dict):
             env=env,
             email_status="log_only",
             extra_facts={
-                "User":             user,
-                "Threat score":     f"{score:.0f}",
-                "Previous score":   f"{last[1]:.0f}" if last else "0",
-                "Threshold":        str(THREAT_ALERT_THRESHOLD),
-                "Off-hours":        str(off_hours),
-                "Note":             "Score decays over time; high score means sustained activity",
+                "Threat score":   f"{score:.0f}",
+                "Previous score": f"{last[1]:.0f}" if last else "0",
+                "Threshold":      str(THREAT_ALERT_THRESHOLD),
+                "Off-hours":      "Yes — outside business hours" if off_hours else "No",
+                "Note":           "Score decays over time; sustained suspicious activity raises it",
             }
         )
 
 # -----------------------------------------------------------------
-# Lightweight HTML email builder (light theme, no scrolling needed)
+# Lightweight HTML email builder (light theme, inbox-friendly)
 # -----------------------------------------------------------------
 _SEV_COLOR = {
     "CRITICAL": "#c0392b",
-    "HIGH":     "#e67e22",
-    "MEDIUM":   "#f39c12",
-    "LOW":      "#2980b9",
+    "HIGH":     "#d35400",
+    "MEDIUM":   "#d4a017",
+    "LOW":      "#2471a3",
 }
-_SEV_ICON = {
-    "CRITICAL": "[!!]",
-    "HIGH":     "[!]",
-    "MEDIUM":   "[~]",
-    "LOW":      "[i]",
+_SEV_BG = {
+    "CRITICAL": "#fdf2f2",
+    "HIGH":     "#fdf6f0",
+    "MEDIUM":   "#fefdf0",
+    "LOW":      "#f0f6fd",
+}
+_SEV_BADGE = {
+    "CRITICAL": "background:#c0392b;color:#fff;",
+    "HIGH":     "background:#d35400;color:#fff;",
+    "MEDIUM":   "background:#d4a017;color:#fff;",
+    "LOW":      "background:#2471a3;color:#fff;",
+}
+_SEV_NEXT_STEP = {
+    "CRITICAL": (
+        "Investigate immediately. SSH to the server and check running processes, "
+        "open connections, and recent auth.log entries. If the event is confirmed "
+        "malicious, consider isolating the server from the network."
+    ),
+    "HIGH": (
+        "Review within the next hour. Log into the server and verify whether the "
+        "activity was authorised. Check who was logged in at the time and what "
+        "else they did around the same timestamp."
+    ),
+    "MEDIUM": (
+        "Review at your earliest convenience. Confirm whether this activity was "
+        "expected. If not, escalate to HIGH and investigate the user's recent "
+        "session history."
+    ),
+    "LOW": (
+        "No immediate action required. This event has been logged for your "
+        "records and contributes to the user's threat score."
+    ),
 }
 
 
@@ -443,78 +475,166 @@ def _esc(s: str) -> str:
 
 def build_html_email(severity, alert_type, user, detail,
                      context_lines=None, extra_facts=None) -> str:
-    color   = _SEV_COLOR.get(severity, "#7f8c8d")
-    icon    = _SEV_ICON.get(severity, "[?]")
-    now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    color      = _SEV_COLOR.get(severity, "#7f8c8d")
+    badge_css  = _SEV_BADGE.get(severity, "background:#7f8c8d;color:#fff;")
+    body_bg    = _SEV_BG.get(severity, "#f9f9f9")
+    next_step  = _SEV_NEXT_STEP.get(severity, "")
+    now_str    = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
 
+    # ── Severity badge (pill shape) ──────────────────────────────────
+    badge_html = (
+        f"<span style='{badge_css}padding:3px 10px;border-radius:12px;"
+        f"font-size:11px;font-weight:bold;letter-spacing:0.5px;"
+        f"text-transform:uppercase;'>{_esc(severity)}</span>"
+    )
+
+    # ── Details table (zebra rows, only show real data) ──────────────
     facts_html = ""
     if extra_facts:
-        rows = "".join(
-            f"<tr>"
-            f"<td style='padding:4px 10px 4px 0;color:#555;font-size:13px;"
-            f"white-space:nowrap;vertical-align:top;'><b>{_esc(k)}</b></td>"
-            f"<td style='padding:4px 0 4px 8px;font-size:13px;color:#222;"
-            f"word-break:break-all;'>{_esc(v)}</td>"
-            f"</tr>"
-            for k, v in extra_facts.items()
-        )
+        rows = ""
+        for i, (k, v) in enumerate(extra_facts.items()):
+            row_bg = "#f8f8f8" if i % 2 == 0 else "#ffffff"
+            rows += (
+                f"<tr style='background:{row_bg};'>"
+                f"<td style='padding:6px 12px 6px 0;color:#555;font-size:13px;"
+                f"white-space:nowrap;vertical-align:top;width:1%;'>"
+                f"<b>{_esc(k)}</b></td>"
+                f"<td style='padding:6px 0 6px 12px;font-size:13px;color:#222;"
+                f"word-break:break-all;border-left:2px solid #ececec;padding-left:12px;'>"
+                f"{_esc(v)}</td>"
+                f"</tr>"
+            )
         facts_html = (
-            f"<p style='margin:14px 0 5px;font-size:11px;color:#888;"
-            f"text-transform:uppercase;'>Details</p>"
+            f"<p style='margin:18px 0 6px;font-size:10px;font-weight:bold;"
+            f"color:#999;text-transform:uppercase;letter-spacing:0.8px;'>Details</p>"
             f"<table cellspacing='0' cellpadding='0' width='100%' "
-            f"style='border-collapse:collapse;border:1px solid #ddd;'>{rows}</table>"
+            f"style='border-collapse:collapse;border:1px solid #e8e8e8;"
+            f"border-radius:4px;overflow:hidden;'>{rows}</table>"
         )
 
+    # ── Log context block ────────────────────────────────────────────
     ctx_html = ""
     if context_lines:
         lines_esc = "\n".join(_esc(ln) for ln in context_lines[:6])
         ctx_html = (
-            f"<p style='margin:14px 0 5px;font-size:11px;color:#888;"
-            f"text-transform:uppercase;'>Log Context</p>"
-            f"<pre style='background:#f6f8fa;border:1px solid #ddd;"
-            f"padding:8px;font-size:11px;margin:0;white-space:pre-wrap;"
-            f"word-break:break-word;'>{lines_esc}</pre>"
+            f"<p style='margin:18px 0 6px;font-size:10px;font-weight:bold;"
+            f"color:#999;text-transform:uppercase;letter-spacing:0.8px;'>Log Context</p>"
+            f"<pre style='background:#1e1e1e;color:#d4d4d4;border-radius:4px;"
+            f"padding:10px 12px;font-size:11px;margin:0;white-space:pre-wrap;"
+            f"word-break:break-word;font-family:\"Courier New\",monospace;'>"
+            f"{lines_esc}</pre>"
+        )
+
+    # ── Next-step guidance ───────────────────────────────────────────
+    next_step_html = ""
+    if next_step:
+        next_step_html = (
+            f"<div style='margin-top:18px;padding:10px 14px;"
+            f"background:#f0f7ff;border-left:3px solid {color};"
+            f"border-radius:0 4px 4px 0;'>"
+            f"<p style='margin:0 0 3px;font-size:10px;font-weight:bold;"
+            f"color:{color};text-transform:uppercase;letter-spacing:0.8px;'>"
+            f"Suggested action</p>"
+            f"<p style='margin:0;font-size:12px;color:#333;line-height:1.5;'>"
+            f"{_esc(next_step)}</p>"
+            f"</div>"
         )
 
     detail_esc = _esc(detail)
+
     return f"""<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8">
+<head>
+<meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Security Alert</title></head>
-<body style="margin:0;padding:0;background:#f0f2f5;font-family:Arial,sans-serif;">
-<table width="100%" cellspacing="0" cellpadding="0" style="background:#f0f2f5;padding:20px 10px;">
+<title>Security Alert — {_esc(severity)}</title>
+</head>
+<body style="margin:0;padding:0;background:#f0f2f5;font-family:Arial,Helvetica,sans-serif;">
+<table width="100%" cellspacing="0" cellpadding="0"
+       style="background:#f0f2f5;padding:24px 12px;">
 <tr><td align="center">
-<table width="540" cellspacing="0" cellpadding="0"
-  style="max-width:540px;width:100%;background:#fff;border-radius:6px;
-         border:1px solid #ddd;box-shadow:0 2px 6px rgba(0,0,0,.08);">
+
+<!-- Card -->
+<table width="560" cellspacing="0" cellpadding="0"
+       style="max-width:560px;width:100%;background:#ffffff;border-radius:8px;
+              border:1px solid #dde1e7;box-shadow:0 2px 8px rgba(0,0,0,.09);">
+
+  <!-- Colour bar -->
   <tr>
-    <td style="background:{color};padding:10px 18px;border-radius:6px 6px 0 0;">
-      <span style="color:#fff;font-size:14px;font-weight:bold;">
-        {icon} {severity} ALERT &mdash; {HOSTNAME}
-      </span>
+    <td style="background:{color};height:4px;border-radius:8px 8px 0 0;
+               font-size:0;line-height:0;">&nbsp;</td>
+  </tr>
+
+  <!-- Header -->
+  <tr>
+    <td style="padding:20px 24px 14px;border-bottom:1px solid #eef0f3;
+               background:{body_bg};border-radius:0;">
+      <table width="100%" cellspacing="0" cellpadding="0">
+        <tr>
+          <td style="vertical-align:middle;">
+            {badge_html}
+            <span style="font-size:11px;color:#888;margin-left:8px;">{_esc(now_str)}</span>
+          </td>
+          <td align="right" style="vertical-align:middle;">
+            <span style="font-size:11px;color:#aaa;">{_esc(HOSTNAME)}</span>
+          </td>
+        </tr>
+        <tr>
+          <td colspan="2" style="padding-top:10px;">
+            <h1 style="margin:0;font-size:18px;font-weight:bold;
+                        color:#1a1a1a;line-height:1.3;">
+              {_esc(alert_type)}
+            </h1>
+            <p style="margin:4px 0 0;font-size:12px;color:#666;">
+              Affected user: <b style="color:#333;">{_esc(user)}</b>
+            </p>
+          </td>
+        </tr>
+      </table>
     </td>
   </tr>
+
+  <!-- Body -->
   <tr>
-    <td style="padding:18px;">
-      <h2 style="margin:0 0 4px;font-size:16px;color:#1a1a1a;">{_esc(alert_type)}</h2>
-      <p style="margin:0 0 14px;font-size:12px;color:#888;">
-        {now_str} &bull; user: <b>{_esc(user)}</b></p>
-      <p style="margin:0 0 5px;font-size:11px;color:#888;text-transform:uppercase;">Summary</p>
-      <pre style="background:#f6f8fa;border:1px solid #ddd;border-radius:4px;
-                  padding:8px;font-size:12px;margin:0;white-space:pre-wrap;
-                  word-break:break-word;">{detail_esc}</pre>
+    <td style="padding:20px 24px;">
+
+      <!-- Summary -->
+      <p style="margin:0 0 6px;font-size:10px;font-weight:bold;
+                color:#999;text-transform:uppercase;letter-spacing:0.8px;">What happened</p>
+      <div style="background:#f6f8fa;border:1px solid #e1e4e8;border-radius:4px;
+                  padding:10px 14px;font-size:13px;color:#24292e;line-height:1.6;
+                  white-space:pre-wrap;word-break:break-word;font-family:inherit;">
+{detail_esc}
+      </div>
+
       {facts_html}
       {ctx_html}
+      {next_step_html}
+
     </td>
   </tr>
+
+  <!-- Footer -->
   <tr>
-    <td style="background:#f6f8fa;padding:8px 18px;border-top:1px solid #ddd;
-               border-radius:0 0 6px 6px;font-size:11px;color:#aaa;text-align:center;">
-      Smart Monitor v3.0 &bull; {HOSTNAME} &bull; Auto-generated
+    <td style="background:#f6f8fa;padding:10px 24px;
+               border-top:1px solid #eef0f3;border-radius:0 0 8px 8px;">
+      <table width="100%" cellspacing="0" cellpadding="0">
+        <tr>
+          <td style="font-size:10px;color:#aaa;">
+            Smart Monitor v3.0 &bull; {_esc(HOSTNAME)}
+          </td>
+          <td align="right" style="font-size:10px;color:#aaa;">
+            Full logs: <code style="font-size:10px;">
+            sudo tail -f /var/log/smart_monitor.log</code>
+          </td>
+        </tr>
+      </table>
     </td>
   </tr>
+
 </table>
+<!-- /Card -->
+
 </td></tr></table>
 </body></html>"""
 
@@ -671,7 +791,10 @@ def send_alert_email(subject: str, html_body: str, env: dict) -> bool:
 # -----------------------------------------------------------------
 def trigger_alert(severity, alert_type, user, detail, env,
                   context_lines=None, extra_facts=None):
-    key = _alert_key(alert_type + user)
+    # Dedup key: alert_type + user + first 80 chars of detail
+    # This ensures "naveen deleted /etc/passwd" and "naveen deleted /var/log/auth.log"
+    # are separate alert buckets while still collapsing rapid duplicates.
+    key = _alert_key(alert_type + str(user), detail[:80])
     if not should_alert(key, severity):
         return
 
@@ -967,20 +1090,36 @@ def check_auditd_deletions(env: dict):
             continue
 
         DELETION_PID_SEEN[dedup_key] = {"ts": now, "count": 1}
-        path_item = rec.get("name", rec.get("nametype", exe or "?"))
+
+        # Use the file path from the auditd record. 'name' is the actual
+        # path. 'nametype' is an auditd token like NORMAL/DELETE/PARENT —
+        # never show it as the file path. Fall back to exe only.
+        path_item = rec.get("name", "") or exe or "unknown path"
+        # Strip auditd NAMETYPE tokens that look like paths but aren't
+        if path_item.upper() in ("NORMAL", "DELETE", "PARENT", "CREATE", "UNKNOWN"):
+            path_item = exe or "unknown path"
+
+        # Build a clean attribution sentence for the detail field
+        if lateral_target:
+            who_line = f"{real_actor} (switched to '{lateral_target}' via su)"
+        else:
+            who_line = user
+        detail_msg = f"{who_line} deleted: {path_item}  [command: {cmd or exe}]"
+
+        facts: dict = {
+            "Deleted file": path_item,
+            "Command":      cmd or exe,
+            "PID":          pid,
+        }
+        if lateral_target:
+            facts["Actual actor"] = real_actor
+            facts["Account used"] = lateral_target
 
         trigger_alert(
             "HIGH", "File Deletion Detected", user,
-            f"User '{user}' deleted: {path_item}\nCommand: {cmd}\nExe: {exe}",
+            detail_msg,
             env,
-            extra_facts={
-                "User":        user,
-                "File":        path_item,
-                "Command":     cmd,
-                "Exe":         exe,
-                "PID":         pid,
-                "Lateral via": lateral_target or "n/a",
-            }
+            extra_facts=facts,
         )
 
 
@@ -1056,18 +1195,22 @@ def check_auditd_commands(env: dict):
                 if is_user_cmd and not is_root_cmd and severity == "CRITICAL":
                     if not any(kw in desc.lower() for kw in ("reverse shell", "miner", "crypto", "metasploit")):
                         severity = "HIGH"
+
+                facts: dict = {
+                    "Command":    full_cmd,
+                    "Running as": "root (via su/sudo)" if is_root_cmd else "own account",
+                }
+                if target:
+                    facts["Target"] = target
+                if lateral_target:
+                    facts["Actual actor"] = real_actor
+                    facts["Account used"] = lateral_target
+
                 trigger_alert(
                     severity, f"Dangerous Command: {desc}", alert_user,
                     attribution,
                     env,
-                    extra_facts={
-                        "Command":          full_cmd,
-                        "Target":           target,
-                        "User":             alert_user,
-                        "Lateral via":      lateral_target or "n/a",
-                        "Pattern":          desc,
-                        "Running as":       "root" if is_root_cmd else f"uid={uid_int}",
-                    }
+                    extra_facts=facts,
                 )
                 break
 
@@ -1113,6 +1256,24 @@ def check_su_sudo(env: dict):
         if m_sudo:
             user    = m_sudo.group(1).strip()
             command = m_sudo.group(2).strip()
+
+            # ── Key fix: when user is "root", look up the real human ──
+            # Inside a root shell, auth.log logs commands as:
+            #   sudo: root : COMMAND=/usr/sbin/swapoff -a
+            # The real person is whoever is in SU_SESSION_START / IDENTITY_CHAIN.
+            # We suppress a separate "Sudo Command Executed" alert in this case
+            # because check_auditd_commands already fires with full attribution.
+            # We still update IDENTITY_CHAIN so the session stays warm.
+            if user == "root":
+                real_actor, how = _active_root_actor()
+                if real_actor != "root":
+                    # Command already covered by auditd attribution — just keep
+                    # the session alive and skip the duplicate sudo alert.
+                    IDENTITY_CHAIN[real_actor] = now
+                    continue
+                # If we genuinely don't know who this root is, fall through
+                # and log it attributed to root.
+
             IDENTITY_CHAIN[user] = now
             USER_SUDO_COUNT[user] += 1
             off_hours = hour < 6 or hour > 22
@@ -1129,12 +1290,10 @@ def check_su_sudo(env: dict):
 
             trigger_alert(
                 severity, "Sudo Command Executed", user,
-                f"User '{user}' ran sudo: {command}",
+                f"{user} ran sudo: {command}",
                 env,
                 extra_facts={
-                    "User":      user,
-                    "Command":   command,
-                    "Off-hours": str(off_hours),
+                    "Off-hours":            "Yes — outside business hours" if off_hours else "No",
                     "Sudo count (session)": str(USER_SUDO_COUNT[user]),
                 }
             )
@@ -1153,15 +1312,12 @@ def check_su_sudo(env: dict):
             if len(SSH_SUDO_FAILURES[user]) >= 3:
                 trigger_alert(
                     "HIGH", "Repeated Sudo Authentication Failures", user,
-                    f"User '{user}' failed sudo authentication "
-                    f"{len(SSH_SUDO_FAILURES[user])} times in {BRUTE_FORCE_WINDOW} -- "
+                    f"{user} failed sudo authentication "
+                    f"{len(SSH_SUDO_FAILURES[user])} times in {BRUTE_FORCE_WINDOW} — "
                     f"possible privilege escalation attempt",
                     env,
                     extra_facts={
-                        "User":     user,
-                        "Failures": str(len(SSH_SUDO_FAILURES[user])),
-                        "Window":   str(BRUTE_FORCE_WINDOW),
-                        "Risk":     "Could be insider trying to escalate or stolen credentials",
+                        "Risk": "Could be insider trying to escalate or stolen credentials",
                     }
                 )
 
@@ -1169,18 +1325,20 @@ def check_su_sudo(env: dict):
         m_su_root = re.search(
             r"su[do]*.*:\s+(session opened for user root).*by\s+(\S+)", line, re.IGNORECASE)
         if m_su_root:
-            actor = m_su_root.group(2).strip().rstrip("(")
+            # Strip everything after the first '(' to clean "prajwal(uid=0)" -> "prajwal"
+            raw_actor = m_su_root.group(2).strip()
+            actor     = re.sub(r'\(.*', '', raw_actor).strip()
             SU_SESSION_START[actor] = now
             IDENTITY_CHAIN[actor]   = now
             off_hours = hour < 6 or hour > 22
             trigger_alert(
                 "HIGH" if off_hours else "MEDIUM",
                 "Root Shell Session Opened", actor,
-                f"User '{actor}' opened a root shell session",
+                f"{actor} opened a root shell (su/sudo). All commands run as root "
+                f"in this session will be attributed to {actor}.",
                 env,
                 extra_facts={
-                    "User":      actor,
-                    "Off-hours": str(off_hours),
+                    "Off-hours": "Yes — outside business hours (6am–10pm)" if off_hours else "No",
                 }
             )
 
@@ -1189,8 +1347,8 @@ def check_su_sudo(env: dict):
         m_su_lateral = re.search(
             r"su(?:do)?.*:\s+session opened for user (\S+) by (\S+)", line, re.IGNORECASE)
         if m_su_lateral:
-            target_user = m_su_lateral.group(1).strip()
-            actor       = m_su_lateral.group(2).strip().rstrip("(")
+            target_user = re.sub(r'\(.*', '', m_su_lateral.group(1).strip())
+            actor       = re.sub(r'\(.*', '', m_su_lateral.group(2).strip())
             if target_user.lower() == "root":
                 pass  # already handled above
             elif actor not in ("root", target_user):
@@ -1199,15 +1357,15 @@ def check_su_sudo(env: dict):
                 off_hours = hour < 6 or hour > 22
                 trigger_alert(
                     "HIGH" if off_hours else "MEDIUM",
-                    "Lateral User Switch (su)", actor,
-                    f"User '{actor}' switched to user '{target_user}' via su. "
-                    f"Any actions taken as '{target_user}' will be attributed to '{actor}'.",
+                    "User Switched Account (su)", actor,
+                    f"{actor} used su to switch into the '{target_user}' account. "
+                    f"Any suspicious activity from '{target_user}' will be attributed back to {actor}.",
                     env,
                     extra_facts={
-                        "Actor":       actor,
-                        "Target user": target_user,
-                        "Off-hours":   str(off_hours),
-                        "Risk":        "Actions by target user should be attributed to actor who su'd in",
+                        "Switched from": actor,
+                        "Switched into": target_user,
+                        "Off-hours":     "Yes — outside business hours" if off_hours else "No",
+                        "Risk":          f"Commands run as '{target_user}' are actually {actor} — check what happens next",
                     }
                 )
 
@@ -1225,7 +1383,7 @@ def check_su_sudo(env: dict):
         m_close_lateral = re.search(
             r"su(?:do)?.*:\s+session closed for user (\S+)", line, re.IGNORECASE)
         if m_close_lateral:
-            closed_user = m_close_lateral.group(1).strip()
+            closed_user = re.sub(r'\(.*', '', m_close_lateral.group(1).strip())
             if closed_user.lower() != "root":
                 for actor in list(LATERAL_SU_CHAIN.keys()):
                     if LATERAL_SU_CHAIN[actor][0] == closed_user:
@@ -1265,14 +1423,14 @@ def check_ssh_bruteforce(env: dict):
             if len(SSH_FAILURES[ip]) >= BRUTE_FORCE_THRESHOLD:
                 trigger_alert(
                     "CRITICAL", "SSH Brute-Force Attack", ip,
-                    f"IP {ip} had {len(SSH_FAILURES[ip])} failed logins "
-                    f"for user '{user}' within {BRUTE_FORCE_WINDOW}",
+                    f"{len(SSH_FAILURES[ip])} failed SSH logins from {ip} "
+                    f"targeting user '{user}' in the last {BRUTE_FORCE_WINDOW}. "
+                    f"This IP is actively trying to break in.",
                     env,
                     extra_facts={
-                        "Source IP":  ip,
+                        "Source IP":   ip,
                         "Target user": user,
-                        "Attempts":   str(len(SSH_FAILURES[ip])),
-                        "Window":     str(BRUTE_FORCE_WINDOW),
+                        "Attempts":    str(len(SSH_FAILURES[ip])),
                     }
                 )
 
@@ -1287,13 +1445,13 @@ def check_ssh_bruteforce(env: dict):
             if len(recent_fails) >= 3:
                 trigger_alert(
                     "CRITICAL", "SSH Login After Brute-Force", user,
-                    f"Successful SSH login for '{user}' from {ip} "
-                    f"after {len(recent_fails)} recent failures -- possible compromise",
+                    f"{user} successfully logged in from {ip} after "
+                    f"{len(recent_fails)} recent failed attempts from that IP. "
+                    f"This strongly suggests the password was cracked or credentials were leaked.",
                     env,
                     extra_facts={
-                        "User":        user,
-                        "Source IP":   ip,
-                        "Prior fails": str(len(recent_fails)),
+                        "Source IP":    ip,
+                        "Failed attempts before login": str(len(recent_fails)),
                     }
                 )
 
@@ -1304,13 +1462,12 @@ def check_ssh_bruteforce(env: dict):
                     trigger_alert(
                         "HIGH" if off_hours else "MEDIUM",
                         "SSH Login From New IP", user,
-                        f"User '{user}' logged in from an IP not seen before: {ip}",
+                        f"{user} logged in from {ip} — this IP has never been seen for this account before.",
                         env,
                         extra_facts={
-                            "User":       user,
                             "New IP":     ip,
-                            "Off-hours":  str(off_hours),
-                            "Risk":       "Could indicate stolen credentials or lateral movement",
+                            "Off-hours":  "Yes — outside business hours" if off_hours else "No",
+                            "Risk":       "Could indicate stolen credentials or account takeover",
                         }
                     )
                 known_ips.add(ip)
@@ -1323,17 +1480,26 @@ def check_ssh_bruteforce(env: dict):
 def check_user_group_changes(env: dict):
     """Detect new user/group creation via useradd/groupadd."""
     lines = get_cycle_lines(AUTH_LOGS + SYSLOG_LOGS)
+    actor, how = _active_root_actor()
     for line in lines:
         m = re.search(
             r"(?:useradd|adduser|groupadd).*(?:new user|new group)[:\s]+name=(\S+)",
             line, re.IGNORECASE)
         if m:
             name = m.group(1).rstrip(",")
+            # Try to find who ran the command from the log line itself
+            m_by = re.search(r"by\s+(\S+)", line, re.IGNORECASE)
+            creator = m_by.group(1) if m_by else (actor if how else "root")
+
             trigger_alert(
-                "HIGH", "New User/Group Created", name,
-                f"New account/group created: {name}\nLog: {line.strip()}",
+                "HIGH", "New User/Group Created", creator,
+                f"{creator} created a new account or group: '{name}'. "
+                f"Verify this was authorized.",
                 env,
-                extra_facts={"Name": name}
+                extra_facts={
+                    "New account/group": name,
+                    "Created by":        creator,
+                }
             )
 
 
@@ -1394,32 +1560,34 @@ def check_proc_scanner(env: dict):
         cmd_line = " ".join(parts[10:])
         for pattern, desc, severity in DANGEROUS_PATTERNS:
             if re.search(pattern, cmd_line, re.IGNORECASE):
-                user = parts[0]
-                # Check if this process owner has an active root session
                 proc_user = parts[0]
                 actor, how = _active_root_actor()
+
                 if how and actor != proc_user:
-                    # The process is running under a user who escalated
                     narrative = (
-                        f"{actor} {('switched to root via ' + how) if how else '(direct root)'} "
-                        f"and a suspicious process is running under '{proc_user}': {cmd_line[:150]}"
+                        f"{actor} switched to root via {how} and a suspicious "
+                        f"process is now running under '{proc_user}': {cmd_line[:150]}"
                     )
+                    alert_user = actor
                 else:
                     narrative = (
-                        f"User '{proc_user}' has a suspicious process running: {cmd_line[:150]}"
+                        f"{proc_user} has a suspicious process running: {cmd_line[:150]}"
                     )
+                    alert_user = proc_user
+
+                facts: dict = {
+                    "PID":     parts[1],
+                    "Command": cmd_line[:200],
+                }
+                if how:
+                    facts["Escalated from"] = actor
+                    facts["How"]            = how
+
                 trigger_alert(
-                    severity, f"Suspicious Process: {desc}", proc_user,
+                    severity, f"Suspicious Process: {desc}", alert_user,
                     narrative,
                     env,
-                    extra_facts={
-                        "User":             proc_user,
-                        "Escalated from":   actor if how else "n/a",
-                        "How":              how or "direct",
-                        "PID":              parts[1],
-                        "Command":          cmd_line[:200],
-                        "Matched pattern":  desc,
-                    }
+                    extra_facts=facts,
                 )
                 break
 
@@ -1460,26 +1628,32 @@ def check_proc_scanner(env: dict):
                         continue
 
                     user = uid_to_name(str(real_uid))
-                    # Did this user escalate to get here?
                     actor, how = _active_root_actor()
                     if how and actor == user:
-                        how_str = f"{user} escalated via {how} — process is now running as effective root"
+                        narrative = (
+                            f"{user} escalated to root via {how} and has a process "
+                            f"running with full root privileges. PID {pid}: {cmd_str}"
+                        )
                     else:
-                        how_str = f"{user} (real UID) has a process running as effective root without a tracked sudo/su session — possible SUID exploit or privilege escalation"
+                        narrative = (
+                            f"{user} has a process running with effective root privileges "
+                            f"but no sudo/su session was recorded for them — possible SUID "
+                            f"exploit or untracked escalation. PID {pid}: {cmd_str}"
+                        )
+
+                    facts: dict = {
+                        "PID":     pid,
+                        "Exe":     exe_path or "unknown",
+                        "Command": cmd_str,
+                    }
+                    if how:
+                        facts["Escalated via"] = how
 
                     trigger_alert(
                         "HIGH", "Root Process From Non-Root User", user,
-                        f"{how_str}\nPID {pid} command: {cmd_str}",
+                        narrative,
                         env,
-                        extra_facts={
-                            "PID":           pid,
-                            "Real user":     user,
-                            "Real UID":      str(real_uid),
-                            "Effective UID": "0 (root)",
-                            "Exe":           exe_path or "?",
-                            "Command":       cmd_str,
-                            "Escalation":    how or "none tracked — suspicious",
-                        }
+                        extra_facts=facts,
                     )
             except Exception:
                 continue
@@ -1516,19 +1690,17 @@ def check_dormant_accounts(env: dict):
                 if age_days > 90:
                     # Try to get login source from 'last' command
                     src_ip = run(f"last -n 1 {username} 2>/dev/null | awk 'NR==1{{print $3}}'")
-                    DORMANT_ALERTED.add(username)   # never re-alert same account
+                    DORMANT_ALERTED.add(username)
+                    from_str = f" from {src_ip}" if src_ip and src_ip != username else ""
                     trigger_alert(
                         "HIGH", "Dormant Account Logged In", username,
-                        f"Account '{username}' was dormant for {age_days} days and "
-                        f"just logged in"
-                        + (f" from {src_ip}" if src_ip and src_ip != username else ""),
+                        f"{username} just logged in{from_str} after {age_days} days of inactivity. "
+                        f"This account was last used on {date_str}.",
                         env,
                         extra_facts={
-                            "User":         username,
-                            "Days dormant": str(age_days),
-                            "Last login":   date_str,
-                            "Login source": src_ip or "unknown",
-                            "Risk":         "Dormant accounts are often used by ex-employees or attackers",
+                            "Days inactive":  str(age_days),
+                            "Last seen":      date_str,
+                            "Login from":     src_ip or "unknown",
                         }
                     )
             except Exception:
@@ -1562,36 +1734,34 @@ def check_kernel_modules(env: dict):
         actor, how = _active_root_actor()
 
         for mod in new_mods:
-            action  = f"loaded kernel module '{mod}' -- possible rootkit persistence"
+            action  = f"loaded kernel module '{mod}' — possible rootkit persistence"
             context = _escalation_context(actor, how, action)
+            facts: dict = {"Module": mod}
+            if how:
+                facts["Escalated via"] = how
             trigger_alert(
                 "CRITICAL", "Kernel Module Loaded", actor,
                 context,
                 env,
-                extra_facts={
-                    "Who":    actor,
-                    "How":    how or "direct root",
-                    "Module": mod,
-                    "Risk":   "Rootkits use kernel modules for persistent, undetectable access",
-                }
+                extra_facts=facts,
             )
 
         for mod in removed_mods:
-            # Ignore common benign transient modules (e.g. dm-* for disk ops)
             if re.match(r"^(dm_|loop|nf_|ip_tables|iptable_)", mod):
                 continue
-            action  = f"unloaded kernel module '{mod}' -- could be covering tracks"
+            action  = f"unloaded kernel module '{mod}' — possibly covering tracks"
             context = _escalation_context(actor, how, action)
+            facts: dict = {
+                "Module": mod,
+                "Risk":   "Attackers unload audit/security modules to evade detection",
+            }
+            if how:
+                facts["Escalated via"] = how
             trigger_alert(
                 "HIGH", "Kernel Module Unloaded", actor,
                 context,
                 env,
-                extra_facts={
-                    "Who":    actor,
-                    "How":    how or "direct root",
-                    "Module": mod,
-                    "Risk":   "Attackers unload security modules (e.g. audit) to evade detection",
-                }
+                extra_facts=facts,
             )
 
     ALERTS_SENT[prev_key + "_data"] = ",".join(current_mods)
@@ -1641,26 +1811,31 @@ def check_network_connections(env: dict):
 
             actor, how = _active_root_actor()
             if how and (proc_user == "root" or proc_user == actor):
-                who_narrative = _escalation_context(actor, how)
+                who_narrative = f"{actor} (root via {how})"
+                alert_user    = actor
             elif proc_user not in ("unknown", "root"):
-                who_narrative = f"user '{proc_user}'"
+                who_narrative = proc_user
+                alert_user    = proc_user
             else:
-                who_narrative = "an unknown/root process"
+                who_narrative = "an unidentified root process"
+                alert_user    = "root"
+
+            facts: dict = {
+                "Port":    str(port),
+                "Process": proc,
+                "Risk":    "This port is commonly used for reverse shells and C2 beacons",
+            }
+            if how:
+                facts["Escalated from"] = actor
+                facts["Via"]            = how
 
             trigger_alert(
-                "CRITICAL", "C2/Reverse-Shell Port Connection", proc_user,
-                f"{who_narrative} has an active outbound connection on "
-                f"known C2/reverse-shell port {port} via process '{proc}'",
+                "CRITICAL", "C2/Reverse-Shell Port Connection", alert_user,
+                f"{who_narrative} has an active connection on port {port} — "
+                f"this port is used for reverse shells and attacker C2 channels. "
+                f"Process: {proc}",
                 env,
-                extra_facts={
-                    "Process user":   proc_user,
-                    "Escalated from": actor if how else "n/a",
-                    "How":            how or "direct",
-                    "Port":           str(port),
-                    "Process":        proc,
-                    "Risk":           "Port commonly used for reverse shells and C2 beacons",
-                    "Raw connection": line.strip()[:200],
-                }
+                extra_facts=facts,
             )
 
 
@@ -1693,16 +1868,14 @@ def check_log_tampering(env: dict):
             if path in LOG_SIZE_SNAPSHOT and LOG_SIZE_SNAPSHOT[path] > 0:
                 action  = f"deleted log file: {path}"
                 context = _escalation_context(actor, how, action)
+                facts: dict = {"File": path}
+                if how:
+                    facts["Escalated via"] = how
                 trigger_alert(
                     "CRITICAL", "Log File Deleted", actor,
                     context,
                     env,
-                    extra_facts={
-                        "Who":           actor,
-                        "How":           how or "direct root",
-                        "File":          path,
-                        "Previous size": str(LOG_SIZE_SNAPSHOT[path]),
-                    }
+                    extra_facts=facts,
                 )
             LOG_SIZE_SNAPSHOT[path] = 0
             continue
@@ -1721,20 +1894,21 @@ def check_log_tampering(env: dict):
                 backup_age = now.timestamp() - os.path.getmtime(backup)
                 is_rotation = backup_age < 120
             if not is_rotation:
-                action  = f"truncated log file: {path}  (was {prev_size} bytes, now {current_size} bytes)"
+                action  = f"truncated log file: {path}  (was {prev_size:,} bytes, now {current_size:,} bytes)"
                 context = _escalation_context(actor, how, action)
+                facts: dict = {
+                    "File":  path,
+                    "Was":   f"{prev_size:,} bytes",
+                    "Now":   f"{current_size:,} bytes",
+                    "Lost":  f"{prev_size - current_size:,} bytes removed",
+                }
+                if how:
+                    facts["Escalated via"] = how
                 trigger_alert(
                     "CRITICAL", "Log File Truncated/Shrunk", actor,
                     context,
                     env,
-                    extra_facts={
-                        "Who":   actor,
-                        "How":   how or "direct root",
-                        "File":  path,
-                        "Was":   f"{prev_size} bytes",
-                        "Now":   f"{current_size} bytes",
-                        "Delta": f"-{prev_size - current_size} bytes",
-                    }
+                    extra_facts=facts,
                 )
         LOG_SIZE_SNAPSHOT[path] = current_size
 
@@ -1793,19 +1967,20 @@ def check_file_integrity(env: dict):
             label   = _file_label.get(fpath, fpath)
             action  = f"modified {label} ({fpath})"
             context = _escalation_context(actor, how, action)
+            facts: dict = {
+                "File":          fpath,
+                "What changed":  label,
+                "Detection":     "SHA256 hash changed — content was altered",
+                "Previous hash": prev_hashes[fpath][:16] + "...",
+                "Current hash":  current_hash[:16] + "...",
+            }
+            if how:
+                facts["Escalated via"] = how
             trigger_alert(
                 "CRITICAL", "Critical File Modified", actor,
                 context,
                 env,
-                extra_facts={
-                    "Who":           actor,
-                    "How":           how or "direct root",
-                    "File":          fpath,
-                    "What":          label,
-                    "Detection":     "SHA256 content hash changed (tamper-proof)",
-                    "Previous hash": prev_hashes[fpath][:16] + "...",
-                    "Current hash":  current_hash[:16] + "...",
-                }
+                extra_facts=facts,
             )
         prev_hashes[fpath] = current_hash
 
@@ -1829,24 +2004,28 @@ def check_insider_evasion(env: dict):
         for pat, desc, severity in EVASION_PATTERNS:
             if re.search(pat, line, re.IGNORECASE):
 
-                # Extract user -- try sudo format first
-                m_sudo_user = re.search(r"sudo:\s+(\S+)\s*:", line)
-                m_for_user  = re.search(r"for\s+(\S+)", line)
+                # Extract user -- try sudo format first (most reliable)
+                # Then try "for user X" only in a session open context
+                # Avoid the loose "for \S+" that matches any word after "for"
+                m_sudo_user  = re.search(r"sudo:\s+(\S+)\s*:", line)
+                m_sess_user  = re.search(r"session opened for user (\S+)", line)
+                m_pam_user   = re.search(r"user=([A-Za-z0-9_.-]+)", line)
                 if m_sudo_user:
-                    user = m_sudo_user.group(1).strip()
-                elif m_for_user:
-                    user = m_for_user.group(1).strip()
+                    user = re.sub(r'\(.*', '', m_sudo_user.group(1)).strip()
+                elif m_sess_user:
+                    user = re.sub(r'\(.*', '', m_sess_user.group(1)).strip()
+                elif m_pam_user:
+                    user = m_pam_user.group(1).strip()
                 else:
                     user = "unknown"
 
                 m_cmd       = re.search(r"COMMAND=(.+)$", line.strip())
                 command_str = m_cmd.group(1).strip() if m_cmd else line.strip()[:200]
 
-                detail = (
-                    f"User '{user}' performed anti-forensic action via sudo: {command_str}"
-                    if (m_sudo_user and m_cmd)
-                    else f"Anti-forensic pattern detected in system log: {line.strip()[:200]}"
-                )
+                if m_sudo_user and m_cmd:
+                    detail = f"{user} ran a command that erases evidence: {command_str}"
+                else:
+                    detail = f"Evidence-destruction pattern detected — {desc}. Log: {line.strip()[:180]}"
 
                 trigger_alert(
                     severity, f"Anti-Forensic Activity: {desc}", user,
@@ -1854,10 +2033,8 @@ def check_insider_evasion(env: dict):
                     env,
                     context_lines=[line.strip()],
                     extra_facts={
-                        "User":    user,
                         "Command": command_str,
-                        "Matched": desc,
-                        "Risk":    "Attacker is attempting to erase evidence of their actions",
+                        "Risk":    "Someone is trying to erase traces of their activity",
                     }
                 )
                 break
@@ -1899,18 +2076,25 @@ def check_suspicious_exec_paths(env: dict):
                     alert_user = user
                     note = ""
 
+                detail_msg = (
+                    f"Process is running from a writable temporary directory: {exe_path}  "
+                    f"(PID {pid}, account: {user}){(' — ' + note) if note else ''}. "
+                    f"No legitimate software runs from /tmp or /dev/shm."
+                )
+
+                facts: dict = {
+                    "PID": pid,
+                    "Exe": exe_path,
+                }
+                if lateral_target:
+                    facts["Actual actor"] = real_actor
+                    facts["Account used"] = lateral_target
+
                 trigger_alert(
                     "CRITICAL", "Process Running From Suspicious Path", alert_user,
-                    f"Process executing from writable/tmp path: {exe_path} "
-                    f"(PID {pid}, user '{user}') {note}",
+                    detail_msg,
                     env,
-                    extra_facts={
-                        "User":      alert_user,
-                        "PID":       pid,
-                        "Exe":       exe_path,
-                        "Risk":      "Malware/implants often execute from /tmp or /dev/shm to avoid detection",
-                        "Lateral":   lateral_target or "n/a",
-                    }
+                    extra_facts=facts,
                 )
     except Exception:
         pass
@@ -1958,16 +2142,20 @@ def check_data_exfiltration(env: dict):
         real_actor, lateral_target = _get_lateral_actor(base_username)
         alert_user = real_actor if lateral_target else user
 
+        detail_msg = f"{alert_user} ran a command that transfers data to an external host: {cmd[:200]}"
+        if lateral_target:
+            detail_msg += f"  (acting as '{lateral_target}' — real actor: {real_actor})"
+
+        facts: dict = {"Command": cmd[:300]}
+        if lateral_target:
+            facts["Actual actor"] = real_actor
+            facts["Account used"] = lateral_target
+
         trigger_alert(
             "HIGH", "Potential Data Exfiltration", alert_user,
-            f"User '{alert_user}' ran a command that may transfer data externally: {cmd[:200]}",
+            detail_msg,
             env,
-            extra_facts={
-                "User":        alert_user,
-                "Command":     cmd[:300],
-                "Lateral via": lateral_target or "n/a",
-                "Risk":        "scp/rsync/sftp to external host could indicate data theft",
-            }
+            extra_facts=facts,
         )
 
 
@@ -2030,10 +2218,24 @@ def check_auditd_sensitive_files(env: dict):
                 label = f"{desc} ({fpath})"
                 break
 
-        # Determine operation type
+        # Determine operation type from syscall number
+        # Use inode-based open flags where available, fallback to sensible label
         syscall = rec.get("syscall", "")
-        op_map  = {"2": "opened", "3": "read", "257": "opened", "4": "stat"}
-        op      = op_map.get(syscall, "accessed")
+        # Common syscall numbers: open=2, read=0, write=1, openat=257, creat=85
+        # For file watches, auditd fires on the permission bits (r/w/a)
+        # The key_tag tells us why it fired — use that as primary signal
+        if key_tag in ("ld_preload", "log_tampering"):
+            op = "wrote to"
+        elif key_tag == "cron_changes":
+            op = "modified"
+        else:
+            # Fall back to syscall number — map common ones
+            _op_map = {
+                "0": "read", "1": "wrote to", "2": "opened",
+                "3": "read", "4": "checked", "85": "created",
+                "257": "opened", "256": "opened",
+            }
+            op = _op_map.get(syscall, "accessed")
 
         # Check lateral attribution
         base_username = uid_to_name(uid)
@@ -2043,18 +2245,23 @@ def check_auditd_sensitive_files(env: dict):
         # LD_PRELOAD is always CRITICAL
         severity = "CRITICAL" if key_tag == "ld_preload" else "HIGH"
 
+        detail_msg = f"{alert_user} {op} {label}"
+        if lateral_target:
+            detail_msg += f" (acting as '{lateral_target}' — real actor: {real_actor})"
+
+        facts: dict = {
+            "File":      fpath,
+            "Operation": op,
+        }
+        if lateral_target:
+            facts["Actual actor"] = real_actor
+            facts["Account used"] = lateral_target
+
         trigger_alert(
             severity, "Sensitive File Accessed/Modified", alert_user,
-            f"User '{alert_user}' {op} sensitive file: {label}",
+            detail_msg,
             env,
-            extra_facts={
-                "User":        alert_user,
-                "File":        fpath,
-                "File label":  label,
-                "Operation":   op,
-                "Auditd key":  key_tag,
-                "Lateral via": lateral_target or "n/a",
-            }
+            extra_facts=facts,
         )
 
 
@@ -2098,16 +2305,14 @@ def check_user_ssh_keys(env: dict):
                 alert_user = real_actor if lateral_target else (actor if how else username)
                 trigger_alert(
                     "HIGH", "SSH Authorized Keys Deleted", alert_user,
-                    f"User '{username}' authorized_keys was deleted — "
-                    f"could be evidence wiping after adding a backdoor key. "
-                    f"Attributed to: '{alert_user}'",
+                    f"The authorized_keys file for '{username}' was deleted. "
+                    f"This sometimes happens right after adding a backdoor key to cover tracks.",
                     env,
                     extra_facts={
-                        "Account":     username,
-                        "File":        key_path,
-                        "Attributed":  alert_user,
-                        "Lateral via": lateral_target or "n/a",
-                        "Risk":        "Deleting authorized_keys after modification hides backdoor activity",
+                        "Account": username,
+                        "File":    key_path,
+                        **({"Actual actor": real_actor, "Account used": lateral_target}
+                           if lateral_target else {}),
                     }
                 )
                 del _SSH_KEY_HASHES[key_path]
@@ -2153,21 +2358,18 @@ def check_user_ssh_keys(env: dict):
 
                 trigger_alert(
                     "CRITICAL", "SSH Authorized Keys Modified", alert_user,
-                    f"authorized_keys for user '{username}' was modified. "
-                    f"Now contains {key_count} key(s). "
-                    f"Attributed to: '{alert_user}'. "
-                    f"An attacker may have added a persistent SSH backdoor.",
+                    f"The authorized_keys file for '{username}' was modified — "
+                    f"now contains {key_count} key(s). "
+                    f"Someone may have added a persistent SSH backdoor to this account.",
                     env,
                     extra_facts={
-                        "Account":     username,
-                        "File":        key_path,
-                        "Key count":   str(key_count),
-                        "Attributed":  alert_user,
-                        "Lateral via": lateral_target or "n/a",
-                        "Root active": how or "none",
-                        "Risk":        "Adding SSH keys gives persistent remote access without a password",
-                        "Prev hash":   prev_hash[:16] + "...",
-                        "New hash":    current_hash[:16] + "...",
+                        "Account":   username,
+                        "Key count": str(key_count),
+                        **({"Actual actor": real_actor, "Account used": lateral_target}
+                           if lateral_target else {}),
+                        **({"Root session": how} if how and not lateral_target else {}),
+                        "Prev hash": prev_hash[:16] + "...",
+                        "New hash":  current_hash[:16] + "...",
                     }
                 )
                 _SSH_KEY_HASHES[key_path] = current_hash
@@ -2219,15 +2421,14 @@ def check_user_ssh_keys(env: dict):
 
         trigger_alert(
             "CRITICAL", "SSH Keys Written To Another User Account", alert_user,
-            f"User '{alert_user}' wrote to '{owner}' SSH directory: {fpath}. "
-            f"This could be planting a backdoor SSH key in another user's account.",
+            f"{alert_user} wrote to {owner}'s SSH directory: {fpath}. "
+            f"This could be planting a backdoor key in another user's account.",
             env,
             extra_facts={
-                "Actor":       alert_user,
-                "Target acct": owner,
-                "File":        fpath,
-                "Lateral via": lateral_target or "n/a",
-                "Risk":        "Writing another user's authorized_keys = persistent backdoor",
+                "Target account": owner,
+                "File":           fpath,
+                **({"Actual actor": real_actor, "Account used": lateral_target}
+                   if lateral_target else {}),
             }
         )
 
@@ -2300,18 +2501,16 @@ def check_sysrq(env: dict):
 
         trigger_alert(
             "CRITICAL", "SysRq Trigger Write Detected", alert_user,
-            f"User '{alert_user}' wrote to /proc/sysrq-trigger. "
-            f"Command: '{sysrq_char or '?'}' — Effect: {effect}. "
-            f"This can instantly reboot, crash, or destroy the server.",
+            f"{alert_user} wrote to /proc/sysrq-trigger — "
+            f"key '{sysrq_char or '?'}': {effect}",
             env,
             extra_facts={
-                "User":        alert_user,
-                "SysRq char":  sysrq_char or "unknown",
-                "Effect":      effect,
-                "Command":     cmd[:200],
-                "Lateral via": lateral_target or "n/a",
-                "Root via":    how or "direct",
-                "Risk":        "Instant irreversible kernel-level action — reboot/crash/kill all",
+                "SysRq key":  sysrq_char or "unknown",
+                "Effect":     effect,
+                "Command":    cmd[:200] if cmd else "unknown",
+                **({"Escalated via": how} if how else {}),
+                **({"Actual actor": real_actor, "Account used": lateral_target}
+                   if lateral_target else {}),
             }
         )
 
@@ -2383,16 +2582,13 @@ def check_su_failures(env: dict):
                 severity,
                 "Repeated su Authentication Failures",
                 actor,
-                f"User '{actor}' failed to su to '{target}' {count} times "
-                f"in {BRUTE_FORCE_WINDOW} — possible local privilege escalation attempt.",
+                f"{actor} tried to switch to the '{target}' account {count} times "
+                f"with the wrong password in {BRUTE_FORCE_WINDOW}. "
+                f"This looks like a local brute-force or privilege escalation attempt.",
                 env,
                 extra_facts={
-                    "Actor":      actor,
-                    "Target":     target,
-                    "Failures":   str(count),
-                    "Window":     str(BRUTE_FORCE_WINDOW),
-                    "Off-hours":  str(off_hours),
-                    "Risk":       "Repeated su failures indicate local password brute-force or lateral pivot attempt",
+                    "Target account": target,
+                    "Off-hours":      "Yes — outside business hours" if off_hours else "No",
                 }
             )
 
@@ -2485,18 +2681,30 @@ def check_home_dir_snooping(env: dict):
         if any(sp in fpath.lower() for sp in sensitive_paths):
             severity = "HIGH"
 
+        if lateral_target:
+            who_line = f"{real_actor} (acting as '{lateral_target}' via su)"
+        else:
+            who_line = alert_user
+
+        # Describe what kind of path was accessed
+        sensitive_hit = next(
+            (sp for sp in (".ssh", ".bash_history", ".gnupg", "password", "secret", "private")
+             if sp in fpath.lower()), None)
+        if sensitive_hit:
+            path_note = f" — accessed sensitive path containing '{sensitive_hit}'"
+        else:
+            path_note = ""
+
         trigger_alert(
             severity, "Home Directory Snooping", alert_user,
-            f"User '{alert_user}' accessed '{home_owner}' home directory: {fpath}. "
-            f"This could indicate credential harvesting or insider data theft.",
+            f"{who_line} read files inside {home_owner}'s home directory{path_note}: {fpath}",
             env,
             extra_facts={
-                "Actor":        alert_user,
-                "Victim":       home_owner,
-                "File":         fpath,
-                "Off-hours":    str(off_hours),
-                "Lateral via":  lateral_target or "n/a",
-                "Risk":         "Reading another user's home may indicate credential theft or espionage",
+                "Accessed account": home_owner,
+                "File":             fpath,
+                "Off-hours":        "Yes — outside business hours" if off_hours else "No",
+                **({"Actual actor": real_actor, "Account used": lateral_target}
+                   if lateral_target else {}),
             }
         )
 

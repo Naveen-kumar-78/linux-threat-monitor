@@ -155,10 +155,14 @@ DELETION_PID_TTL  = timedelta(minutes=5)
 ALERTS_SENT:        dict = {}
 FILE_OFFSETS:       dict = {}
 SSH_FAILURES:       dict = defaultdict(list)
+SSH_KNOWN_IPS:      dict = defaultdict(set)   # user -> set of seen source IPs
+SSH_SUDO_FAILURES:  dict = defaultdict(list)   # user -> list of failure timestamps
 USER_ROOT_SESSIONS: dict = defaultdict(list)
 USER_SUDO_COUNT:    dict = defaultdict(int)
-IDENTITY_CHAIN:     dict = {}   # user -> datetime of last escalation
+IDENTITY_CHAIN:     dict = {}   # user -> datetime of last escalation (to root)
 SU_SESSION_START:   dict = {}   # user -> datetime root shell opened
+# user -> user they su'd into (non-root lateral movement tracking)
+LATERAL_SU_CHAIN:   dict = {}   # actor -> (target_user, datetime)
 THREAT_SCORE_LOG:   dict = defaultdict(list)
 DELETION_EVENTS:    list = []
 LOG_SIZE_SNAPSHOT:  dict = {}
@@ -221,7 +225,7 @@ def load_env(path: str) -> dict:
 
 
 def load_state():
-    global FILE_OFFSETS, LOG_SIZE_SNAPSHOT, IDENTITY_CHAIN, SU_SESSION_START
+    global FILE_OFFSETS, LOG_SIZE_SNAPSHOT, IDENTITY_CHAIN, SU_SESSION_START, LATERAL_SU_CHAIN, DORMANT_ALERTED
     if os.path.exists(STATE_PATH):
         try:
             with open(STATE_PATH) as f:
@@ -239,6 +243,14 @@ def load_state():
                         SU_SESSION_START[user] = datetime.fromisoformat(ts_str)
                     except Exception:
                         pass
+                # Restore lateral su chain
+                for actor, entry in data.get("lateral_su_chain", {}).items():
+                    try:
+                        LATERAL_SU_CHAIN[actor] = (entry["target"], datetime.fromisoformat(entry["ts"]))
+                    except Exception:
+                        pass
+                # Restore dormant-alerted set so restarts don't re-spam
+                DORMANT_ALERTED = set(data.get("dormant_alerted", []))
         except Exception:
             pass
 
@@ -257,6 +269,13 @@ def save_state():
                 "su_sessions":    {
                     u: ts.isoformat() for u, ts in SU_SESSION_START.items()
                 },
+                # Persist lateral su chain (user1 -> su -> user2)
+                "lateral_su_chain": {
+                    actor: {"target": target, "ts": ts.isoformat()}
+                    for actor, (target, ts) in LATERAL_SU_CHAIN.items()
+                },
+                # Persist dormant-alerted so restarts don't re-spam
+                "dormant_alerted": list(DORMANT_ALERTED),
             }, f, indent=2)
     except Exception:
         pass
@@ -736,6 +755,20 @@ def _active_root_actor() -> tuple[str, str]:
     return "root", ""
 
 
+def _get_lateral_actor(target_user: str) -> tuple[str, str]:
+    """
+    If someone su'd into target_user recently, return (original_actor, target_user).
+    This is the 'innocent user2' scenario: user1 su -> user2 -> does bad things.
+    Returns (target_user, '') if no lateral chain is tracked.
+    """
+    now    = datetime.now(IST)
+    cutoff = timedelta(hours=2)
+    for actor, (target, ts) in LATERAL_SU_CHAIN.items():
+        if target == target_user and (now - ts) <= cutoff:
+            return actor, target_user
+    return target_user, ""
+
+
 def _escalation_context(user: str, how: str, action: str = "") -> str:
     """
     Build a plain-English one-liner explaining who did what and how
@@ -867,10 +900,12 @@ def check_auditd_deletions(env: dict):
     Attributes the deletion to the ORIGINAL LOGIN USER even when via su.
     Deduplication strategy:
     - Whitelist known-safe system processes (Docker, apt, snap, pip...)
-    - Collapse all syscall records from the same PID+user within 5 min
+    - Collapse all records from the same PID+user within 5 min
       into ONE alert (prevents email storm from recursive rm with many files).
-    - Fallback deletion detection via auth.log (less precise).
-    - Looks for: sudo: user -> COMMAND=...rm or shred
+
+    Detection method: uses auditd key 'delete_events' (set in rules by watching
+    rm/shred/rmdir binaries) rather than syscall-name matching in cmd/exe
+    (which is unreliable -- syscall is a number in EXECVE records).
     """
     if not os.path.exists(AUDIT_LOG):
         return
@@ -881,11 +916,19 @@ def check_auditd_deletions(env: dict):
         if now - DELETION_PID_SEEN[key]["ts"] > DELETION_PID_TTL:
             del DELETION_PID_SEEN[key]
 
-    delete_syscalls = re.compile(r"\b(unlink|unlinkat|rmdir|rename|renameat)\b")
+    # Delete detection: match on auditd key='delete_events' OR exe paths of
+    # rm/shred/rmdir/truncate binaries. This is reliable across all architectures.
+    _DELETE_EXE_RE = re.compile(
+        r"(?:/usr)?/bin/(?:rm|shred|rmdir|truncate)\b", re.IGNORECASE)
+
     for rec in _build_audit_records(AUDIT_LOG):
         exe = rec.get("exe", "")
         cmd = rec.get("cmd", "")
-        if not delete_syscalls.search(cmd + exe + rec.get("syscall", "")):
+        key_tag = rec.get("key", "")
+
+        # Match on auditd key OR exe binary name
+        is_delete = (key_tag == "delete_events") or _DELETE_EXE_RE.search(exe or "")
+        if not is_delete:
             continue
 
         uid  = rec.get("uid", "0")
@@ -901,7 +944,22 @@ def check_auditd_deletions(env: dict):
         if DELETION_WHITELIST_EXES.search(exe):
             continue
 
-        user       = _resolve_audit_user(rec)
+        # Skip kernel/daemon events
+        try:
+            if int(auid) >= 4294967294 and int(uid) == 0:
+                continue
+        except ValueError:
+            pass
+
+        user = _resolve_audit_user(rec)
+
+        # Check lateral su attribution: if user2 deleted something but user1
+        # su'd into user2, blame user1
+        base_username = uid_to_name(uid)
+        real_actor, lateral_target = _get_lateral_actor(base_username)
+        if lateral_target:
+            user = f"{real_actor} (acting as '{lateral_target}' via su)"
+
         dedup_key  = f"{pid}:{user}"
 
         if dedup_key in DELETION_PID_SEEN:
@@ -916,11 +974,12 @@ def check_auditd_deletions(env: dict):
             f"User '{user}' deleted: {path_item}\nCommand: {cmd}\nExe: {exe}",
             env,
             extra_facts={
-                "User":     user,
-                "File":     path_item,
-                "Command":  cmd,
-                "Exe":      exe,
-                "PID":      pid,
+                "User":        user,
+                "File":        path_item,
+                "Command":     cmd,
+                "Exe":         exe,
+                "PID":         pid,
+                "Lateral via": lateral_target or "n/a",
             }
         )
 
@@ -930,8 +989,13 @@ def check_auditd_deletions(env: dict):
 # -----------------------------------------------------------------
 def check_auditd_commands(env: dict):
     """
-    Parse auditd EXECVE records to catch ALL commands run as root,
-    attributing them back to the original login user via auid.
+    Parse auditd EXECVE records to catch ALL dangerous commands:
+    1. Commands run as root (uid=0) -- attributed back to original login user via auid.
+    2. Commands run by regular users (uid>=1000) -- catches nmap, hydra, reverse
+       shells, miners, etc. run WITHOUT escalation.
+    3. Commands run via lateral su (user1 su'd into user2): attribute bad
+       actions back to the original actor (user1), not the innocent user2.
+
     This catches commands run inside a sudo/su shell that would not
     appear in auth.log sudo lines.
     """
@@ -947,30 +1011,62 @@ def check_auditd_commands(env: dict):
         uid  = rec.get("uid", "0")
         auid = rec.get("auid", "4294967295")
 
-        # Only care about root-effective commands from non-root original users
         try:
+            uid_int  = int(uid)
             auid_int = int(auid)
         except ValueError:
-            auid_int = 4294967295
-        if int(uid) != 0 or auid_int == 0 or auid_int >= 4294967294:
             continue
 
-        user = _resolve_audit_user(rec)
+        # Skip pure kernel/daemon events (no login session)
+        if auid_int >= 4294967294:
+            continue
+
+        # Determine context:
+        # Case A: running as root (uid=0), original user != root
+        is_root_cmd = (uid_int == 0 and auid_int != 0)
+        # Case B: running as normal user (uid>=1000) with a login session
+        is_user_cmd = (uid_int >= 1000)
+
+        if not is_root_cmd and not is_user_cmd:
+            continue
+
+        user     = _resolve_audit_user(rec)
         full_cmd = cmd or exe
+
+        # Check if this is actually user1 who su'd into user2
+        # (lateral chain): attribute to user1 not user2
+        base_username = uid_to_name(uid)
+        real_actor, lateral_target = _get_lateral_actor(base_username)
+        if lateral_target:
+            # user1 su'd into user2; user2 ran this command -- blame user1
+            attribution = (
+                f"{real_actor} (su'd into '{lateral_target}') ran: {full_cmd}"
+            )
+            alert_user = real_actor
+        else:
+            attribution = f"User '{user}' ran: {full_cmd}"
+            alert_user  = user
 
         for pattern, desc, severity in DANGEROUS_PATTERNS:
             m = re.search(pattern, full_cmd, re.IGNORECASE)
             if m:
                 target = m.groupdict().get("target", "")
+                # For non-root users, cap max severity at HIGH (they can't
+                # do kernel-level damage without escalation)
+                if is_user_cmd and not is_root_cmd and severity == "CRITICAL":
+                    if not any(kw in desc.lower() for kw in ("reverse shell", "miner", "crypto", "metasploit")):
+                        severity = "HIGH"
                 trigger_alert(
-                    severity, f"Dangerous Command: {desc}", user,
-                    f"User '{user}' ran (as root): {full_cmd}",
+                    severity, f"Dangerous Command: {desc}", alert_user,
+                    attribution,
                     env,
                     extra_facts={
-                        "Command":  full_cmd,
-                        "Target":   target,
-                        "User":     user,
-                        "Pattern":  desc,
+                        "Command":          full_cmd,
+                        "Target":           target,
+                        "User":             alert_user,
+                        "Lateral via":      lateral_target or "n/a",
+                        "Pattern":          desc,
+                        "Running as":       "root" if is_root_cmd else f"uid={uid_int}",
                     }
                 )
                 break
@@ -982,15 +1078,36 @@ def check_auditd_commands(env: dict):
 def check_su_sudo(env: dict):
     """
     Detect users switching to root (su/sudo/su -i/sudo su).
+    Also detects lateral su: user1 -> su -> user2 (non-root).
     Tracks per-user escalation frequency; off-hours events get severity bump.
-    Also builds IDENTITY_CHAIN to attribute future root commands.
+    Also builds IDENTITY_CHAIN and LATERAL_SU_CHAIN to attribute future commands.
+
+    Sudo alert suppression: only alert on sudo commands that are NOT
+    already caught by check_auditd_commands (dangerous pattern match).
+    Routine sudo (apt, service restart, etc.) is logged at LOW severity
+    to reduce noise. Off-hours or high-frequency sudo stays HIGH.
     """
     lines = get_cycle_lines(AUTH_LOGS)
     now   = datetime.now(IST)
     hour  = int(now.strftime("%H"))
 
+    # Commands that are routine admin work -- don't alert at HIGH for these
+    _ROUTINE_SUDO_RE = re.compile(
+        r"""(?x)
+        /usr/bin/apt|apt-get|apt\s|dpkg|
+        /usr/bin/systemctl\s+(?:start|stop|restart|reload|status)|
+        /usr/sbin/service\s|
+        /usr/bin/journalctl|
+        /usr/bin/tail|/usr/bin/less|/usr/bin/cat|/usr/bin/grep|
+        /usr/bin/find\s|/usr/bin/ls\s|
+        /usr/bin/nano|/usr/bin/vi|/usr/bin/vim|
+        /usr/bin/pip|/usr/bin/python|
+        /usr/bin/npm|/usr/bin/node
+        """, re.IGNORECASE
+    )
+
     for line in lines:
-        # Sudo: successful execution
+        # ── Sudo: successful execution ───────────────────────────────
         m_sudo = re.search(
             r"sudo:\s+(\S+)\s*:.*COMMAND=(.*)", line, re.IGNORECASE)
         if m_sudo:
@@ -999,9 +1116,17 @@ def check_su_sudo(env: dict):
             IDENTITY_CHAIN[user] = now
             USER_SUDO_COUNT[user] += 1
             off_hours = hour < 6 or hour > 22
-            severity  = "HIGH" if off_hours else "MEDIUM"
-            if USER_SUDO_COUNT[user] >= 5:
+
+            # Determine severity: only escalate for suspicious patterns,
+            # high frequency, or off-hours. Routine admin work → LOW.
+            is_routine = bool(_ROUTINE_SUDO_RE.search(command))
+            if USER_SUDO_COUNT[user] >= 5 or off_hours:
                 severity = "HIGH"
+            elif is_routine:
+                severity = "LOW"
+            else:
+                severity = "MEDIUM"
+
             trigger_alert(
                 severity, "Sudo Command Executed", user,
                 f"User '{user}' ran sudo: {command}",
@@ -1014,11 +1139,37 @@ def check_su_sudo(env: dict):
                 }
             )
 
-        # su / su - / sudo su -- session opened for root
-        m_su = re.search(
+        # ── Failed sudo (wrong password / not in sudoers) ────────────
+        m_sudo_fail = re.search(
+            r"sudo:\s+(\S+)\s*:.*(?:authentication failure|NOT in sudoers|incorrect password)",
+            line, re.IGNORECASE)
+        if m_sudo_fail:
+            user = m_sudo_fail.group(1).strip()
+            SSH_SUDO_FAILURES[user].append(now)
+            SSH_SUDO_FAILURES[user] = [
+                t for t in SSH_SUDO_FAILURES[user]
+                if (now - t) <= BRUTE_FORCE_WINDOW
+            ]
+            if len(SSH_SUDO_FAILURES[user]) >= 3:
+                trigger_alert(
+                    "HIGH", "Repeated Sudo Authentication Failures", user,
+                    f"User '{user}' failed sudo authentication "
+                    f"{len(SSH_SUDO_FAILURES[user])} times in {BRUTE_FORCE_WINDOW} -- "
+                    f"possible privilege escalation attempt",
+                    env,
+                    extra_facts={
+                        "User":     user,
+                        "Failures": str(len(SSH_SUDO_FAILURES[user])),
+                        "Window":   str(BRUTE_FORCE_WINDOW),
+                        "Risk":     "Could be insider trying to escalate or stolen credentials",
+                    }
+                )
+
+        # ── su / su - / sudo su -> ROOT session opened ───────────────
+        m_su_root = re.search(
             r"su[do]*.*:\s+(session opened for user root).*by\s+(\S+)", line, re.IGNORECASE)
-        if m_su:
-            actor = m_su.group(2).strip().rstrip("(")
+        if m_su_root:
+            actor = m_su_root.group(2).strip().rstrip("(")
             SU_SESSION_START[actor] = now
             IDENTITY_CHAIN[actor]   = now
             off_hours = hour < 6 or hour > 22
@@ -1033,9 +1184,36 @@ def check_su_sudo(env: dict):
                 }
             )
 
-        # Session closed -- remove from identity chain
-        m_close = re.search(r"session closed for user root", line, re.IGNORECASE)
-        if m_close:
+        # ── su -> NON-ROOT user session opened (lateral movement) ────
+        # e.g. "su: session opened for user naveen by ubuntu(uid=1001)"
+        m_su_lateral = re.search(
+            r"su(?:do)?.*:\s+session opened for user (\S+) by (\S+)", line, re.IGNORECASE)
+        if m_su_lateral:
+            target_user = m_su_lateral.group(1).strip()
+            actor       = m_su_lateral.group(2).strip().rstrip("(")
+            if target_user.lower() == "root":
+                pass  # already handled above
+            elif actor not in ("root", target_user):
+                # user1 su'd into user2 -- record for later attribution
+                LATERAL_SU_CHAIN[actor] = (target_user, now)
+                off_hours = hour < 6 or hour > 22
+                trigger_alert(
+                    "HIGH" if off_hours else "MEDIUM",
+                    "Lateral User Switch (su)", actor,
+                    f"User '{actor}' switched to user '{target_user}' via su. "
+                    f"Any actions taken as '{target_user}' will be attributed to '{actor}'.",
+                    env,
+                    extra_facts={
+                        "Actor":       actor,
+                        "Target user": target_user,
+                        "Off-hours":   str(off_hours),
+                        "Risk":        "Actions by target user should be attributed to actor who su'd in",
+                    }
+                )
+
+        # ── Session closed -- clean up identity tracking ─────────────
+        m_close_root = re.search(r"session closed for user root", line, re.IGNORECASE)
+        if m_close_root:
             for user in list(SU_SESSION_START.keys()):
                 if (now - SU_SESSION_START[user]) < timedelta(hours=2):
                     duration = now - SU_SESSION_START[user]
@@ -1043,22 +1221,40 @@ def check_su_sudo(env: dict):
                     del SU_SESSION_START[user]
                     break
 
+        # Clean up lateral su sessions on close
+        m_close_lateral = re.search(
+            r"su(?:do)?.*:\s+session closed for user (\S+)", line, re.IGNORECASE)
+        if m_close_lateral:
+            closed_user = m_close_lateral.group(1).strip()
+            if closed_user.lower() != "root":
+                for actor in list(LATERAL_SU_CHAIN.keys()):
+                    if LATERAL_SU_CHAIN[actor][0] == closed_user:
+                        log(f"Lateral su session: '{actor}' -> '{closed_user}' ended")
+                        del LATERAL_SU_CHAIN[actor]
+                        break
+
 
 # -----------------------------------------------------------------
-# Check: SSH brute-force
+# Check: SSH brute-force and new-IP login
 # -----------------------------------------------------------------
 def check_ssh_bruteforce(env: dict):
     """
-    Track failed SSH logins per source IP.
+    Track failed SSH logins per source IP (IPv4 and IPv6).
     Fire CRITICAL when failures exceed threshold within window.
-    Also detect successful login after multiple failures (likely compromise).
+    Also detect:
+    - Successful login after multiple failures (likely compromise)
+    - Successful login from a never-before-seen IP for a known user
     """
     lines = get_cycle_lines(AUTH_LOGS)
     now   = datetime.now(IST)
+    hour  = int(now.strftime("%H"))
+
+    # IPv4 and IPv6 address pattern
+    _IP_RE = r"([\da-fA-F:\.]+)"
 
     for line in lines:
         m_fail = re.search(
-            r"Failed (?:password|publickey) for (?:invalid user )?(\S+) from ([\d.]+)",
+            r"Failed (?:password|publickey) for (?:invalid user )?(\S+) from " + _IP_RE,
             line)
         if m_fail:
             user, ip = m_fail.group(1), m_fail.group(2)
@@ -1081,10 +1277,13 @@ def check_ssh_bruteforce(env: dict):
                 )
 
         m_ok = re.search(
-            r"Accepted (?:password|publickey) for (\S+) from ([\d.]+)", line)
+            r"Accepted (?:password|publickey) for (\S+) from " + _IP_RE, line)
         if m_ok:
             user, ip = m_ok.group(1), m_ok.group(2)
             recent_fails = SSH_FAILURES.get(ip, [])
+            off_hours    = hour < 6 or hour > 22
+
+            # Alert: login after brute-force
             if len(recent_fails) >= 3:
                 trigger_alert(
                     "CRITICAL", "SSH Login After Brute-Force", user,
@@ -1097,6 +1296,25 @@ def check_ssh_bruteforce(env: dict):
                         "Prior fails": str(len(recent_fails)),
                     }
                 )
+
+            # Alert: login from a new/unknown IP for this user
+            known_ips = SSH_KNOWN_IPS[user]
+            if ip not in known_ips:
+                if known_ips:  # only alert if we have a baseline (not first-ever login)
+                    trigger_alert(
+                        "HIGH" if off_hours else "MEDIUM",
+                        "SSH Login From New IP", user,
+                        f"User '{user}' logged in from an IP not seen before: {ip}",
+                        env,
+                        extra_facts={
+                            "User":       user,
+                            "New IP":     ip,
+                            "Off-hours":  str(off_hours),
+                            "Risk":       "Could indicate stolen credentials or lateral movement",
+                        }
+                    )
+                known_ips.add(ip)
+                SSH_KNOWN_IPS[user] = known_ips
 
 
 # -----------------------------------------------------------------
@@ -1326,6 +1544,7 @@ def check_kernel_modules(env: dict):
     """
     Detect new kernel modules loaded since last check.
     Rootkits commonly use insmod/modprobe for kernel-level persistence.
+    Also detect modules that were unloaded (rootkit covering tracks).
     """
     current_mods = set(run("lsmod | awk 'NR>1{print $1}'").splitlines())
     prev_key = "_kernel_mods"
@@ -1336,23 +1555,45 @@ def check_kernel_modules(env: dict):
         ALERTS_SENT[prev_key + "_data"] = ",".join(current_mods)
         return
 
-    new_mods = current_mods - prev_mods
-    if new_mods:
+    new_mods     = current_mods - prev_mods
+    removed_mods = prev_mods - current_mods
+
+    if new_mods or removed_mods:
         actor, how = _active_root_actor()
-    for mod in new_mods:
-        action  = f"loaded kernel module '{mod}' -- this is a rootkit persistence technique"
-        context = _escalation_context(actor, how, action)
-        trigger_alert(
-            "CRITICAL", "Kernel Module Loaded", actor,
-            context,
-            env,
-            extra_facts={
-                "Who":    actor,
-                "How":    how or "direct root",
-                "Module": mod,
-                "Risk":   "Rootkits use kernel modules for persistent, undetectable access",
-            }
-        )
+
+        for mod in new_mods:
+            action  = f"loaded kernel module '{mod}' -- possible rootkit persistence"
+            context = _escalation_context(actor, how, action)
+            trigger_alert(
+                "CRITICAL", "Kernel Module Loaded", actor,
+                context,
+                env,
+                extra_facts={
+                    "Who":    actor,
+                    "How":    how or "direct root",
+                    "Module": mod,
+                    "Risk":   "Rootkits use kernel modules for persistent, undetectable access",
+                }
+            )
+
+        for mod in removed_mods:
+            # Ignore common benign transient modules (e.g. dm-* for disk ops)
+            if re.match(r"^(dm_|loop|nf_|ip_tables|iptable_)", mod):
+                continue
+            action  = f"unloaded kernel module '{mod}' -- could be covering tracks"
+            context = _escalation_context(actor, how, action)
+            trigger_alert(
+                "HIGH", "Kernel Module Unloaded", actor,
+                context,
+                env,
+                extra_facts={
+                    "Who":    actor,
+                    "How":    how or "direct root",
+                    "Module": mod,
+                    "Risk":   "Attackers unload security modules (e.g. audit) to evade detection",
+                }
+            )
+
     ALERTS_SENT[prev_key + "_data"] = ",".join(current_mods)
 
 
@@ -1623,6 +1864,644 @@ def check_insider_evasion(env: dict):
 
 
 # -----------------------------------------------------------------
+# Check: processes running from suspicious paths (/tmp, /dev/shm)
+# -----------------------------------------------------------------
+def check_suspicious_exec_paths(env: dict):
+    """
+    Detect processes executing from /tmp, /dev/shm, /run/user, or other
+    writable directories -- a classic malware/implant indicator.
+    Legitimate software never runs from these locations.
+    """
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                exe_path = os.readlink(f"/proc/{pid}/exe")
+            except Exception:
+                continue
+
+            if re.match(r"^/(?:tmp|dev/shm|run/user|var/tmp)/", exe_path):
+                try:
+                    status = open(f"/proc/{pid}/status", errors="replace").read()
+                    uid_m  = re.search(r"^Uid:\s+(\d+)", status, re.M)
+                    uid    = uid_m.group(1) if uid_m else "?"
+                    user   = uid_to_name(uid)
+                except Exception:
+                    user = "unknown"
+
+                # Check lateral attribution
+                real_actor, lateral_target = _get_lateral_actor(user)
+                if lateral_target:
+                    alert_user = real_actor
+                    note = f"(originally executed as '{lateral_target}' by '{real_actor}' via su)"
+                else:
+                    alert_user = user
+                    note = ""
+
+                trigger_alert(
+                    "CRITICAL", "Process Running From Suspicious Path", alert_user,
+                    f"Process executing from writable/tmp path: {exe_path} "
+                    f"(PID {pid}, user '{user}') {note}",
+                    env,
+                    extra_facts={
+                        "User":      alert_user,
+                        "PID":       pid,
+                        "Exe":       exe_path,
+                        "Risk":      "Malware/implants often execute from /tmp or /dev/shm to avoid detection",
+                        "Lateral":   lateral_target or "n/a",
+                    }
+                )
+    except Exception:
+        pass
+
+
+# -----------------------------------------------------------------
+# Check: data exfiltration patterns (scp, rsync, large curl/wget)
+# -----------------------------------------------------------------
+def check_data_exfiltration(env: dict):
+    """
+    Detect potential data exfiltration via:
+    - scp / sftp outbound transfers
+    - rsync to remote hosts
+    - Large data piped to curl/wget
+    - tar + curl/wget (pack and send)
+    """
+    if not os.path.exists(AUDIT_LOG):
+        return
+
+    _EXFIL_RE = re.compile(
+        r"""(?x)
+        \bscp\s+.*\s[\w@][\w.@-]+:  # scp to remote
+        |\brsync\s+.*(?:-e\s+ssh|rsync://)  # rsync over ssh
+        |\btar\s+.*\|\s*(?:curl|wget|nc\b|socat)  # tar piped to network
+        |\bcurl\s+.*--data-binary\s+@  # curl uploading file
+        |\bsftp\b                    # sftp session
+        """, re.IGNORECASE
+    )
+
+    for rec in _build_audit_records(AUDIT_LOG):
+        cmd = rec.get("cmd", "")
+        if not _EXFIL_RE.search(cmd):
+            continue
+
+        uid  = rec.get("uid", "0")
+        auid = rec.get("auid", "4294967295")
+        try:
+            if int(auid) >= 4294967294:
+                continue
+        except ValueError:
+            pass
+
+        user = _resolve_audit_user(rec)
+        base_username = uid_to_name(uid)
+        real_actor, lateral_target = _get_lateral_actor(base_username)
+        alert_user = real_actor if lateral_target else user
+
+        trigger_alert(
+            "HIGH", "Potential Data Exfiltration", alert_user,
+            f"User '{alert_user}' ran a command that may transfer data externally: {cmd[:200]}",
+            env,
+            extra_facts={
+                "User":        alert_user,
+                "Command":     cmd[:300],
+                "Lateral via": lateral_target or "n/a",
+                "Risk":        "scp/rsync/sftp to external host could indicate data theft",
+            }
+        )
+
+
+# -----------------------------------------------------------------
+# Check: auditd sensitive file access (key=sensitive_files)
+# -----------------------------------------------------------------
+def check_auditd_sensitive_files(env: dict):
+    """
+    Parse auditd records with key=sensitive_files or key=ld_preload.
+    These are written by the file watches in smart_monitor_auditd.rules:
+    /etc/passwd, /etc/shadow, /etc/sudoers, sshd_config, authorized_keys, etc.
+    """
+    if not os.path.exists(AUDIT_LOG):
+        return
+
+    _SENSITIVE_KEYS = {"sensitive_files", "ld_preload", "cron_changes"}
+    _SENSITIVE_LABELS = {
+        "/etc/passwd":                "user account database",
+        "/etc/shadow":                "password hash file",
+        "/etc/sudoers":               "sudoers privilege config",
+        "/etc/sudoers.d":             "sudoers.d privilege config",
+        "/etc/ssh/sshd_config":       "SSH daemon config",
+        "/root/.ssh":                 "root SSH keys",
+        "/root/.bashrc":              "root shell config",
+        "/etc/hosts":                 "hosts file",
+        "/etc/ld.so.preload":         "LD_PRELOAD injection file",
+        "/etc/crontab":               "system crontab",
+        "/etc/cron.d":                "cron.d directory",
+        "/var/spool/cron":            "user crontabs",
+    }
+
+    for rec in _build_audit_records(AUDIT_LOG):
+        key_tag = rec.get("key", "")
+        if key_tag not in _SENSITIVE_KEYS:
+            continue
+
+        uid  = rec.get("uid", "0")
+        auid = rec.get("auid", "4294967295")
+        try:
+            auid_int = int(auid)
+        except ValueError:
+            auid_int = 4294967295
+
+        # Skip pure kernel/system events
+        if auid_int >= 4294967294 and int(uid) == 0:
+            continue
+
+        # Skip known system service accounts
+        uname = uid_to_name(uid)
+        if uname in DELETION_WHITELIST_USERS:
+            continue
+
+        user = _resolve_audit_user(rec)
+        fpath = rec.get("name", rec.get("exe", "?"))
+
+        # Find the best matching label
+        label = fpath
+        for path_prefix, desc in _SENSITIVE_LABELS.items():
+            if fpath.startswith(path_prefix):
+                label = f"{desc} ({fpath})"
+                break
+
+        # Determine operation type
+        syscall = rec.get("syscall", "")
+        op_map  = {"2": "opened", "3": "read", "257": "opened", "4": "stat"}
+        op      = op_map.get(syscall, "accessed")
+
+        # Check lateral attribution
+        base_username = uid_to_name(uid)
+        real_actor, lateral_target = _get_lateral_actor(base_username)
+        alert_user = real_actor if lateral_target else user
+
+        # LD_PRELOAD is always CRITICAL
+        severity = "CRITICAL" if key_tag == "ld_preload" else "HIGH"
+
+        trigger_alert(
+            severity, "Sensitive File Accessed/Modified", alert_user,
+            f"User '{alert_user}' {op} sensitive file: {label}",
+            env,
+            extra_facts={
+                "User":        alert_user,
+                "File":        fpath,
+                "File label":  label,
+                "Operation":   op,
+                "Auditd key":  key_tag,
+                "Lateral via": lateral_target or "n/a",
+            }
+        )
+
+
+# -----------------------------------------------------------------
+# Check: non-root SSH authorized_keys modification
+# -----------------------------------------------------------------
+
+# Track authorized_keys content hashes for all users to detect changes
+_SSH_KEY_HASHES: dict = {}   # path -> sha256 hex
+
+def check_user_ssh_keys(env: dict):
+    """
+    Detect when any user's ~/.ssh/authorized_keys is created, modified,
+    or deleted. This catches SSH backdoor planting on normal accounts —
+    an attacker who gains write access to /home/naveen/.ssh/ can add
+    their own key to permanently re-enter as naveen.
+
+    Strategy:
+    - Scan /home/*/  .ssh/authorized_keys on every cycle
+    - SHA256 hash each file; alert on first appearance, change, or deletion
+    - Also check via auditd key=user_ssh_keys for immediate detection
+    - Lateral attribution: if user1 su'd into user2 and modified user2's
+      keys, blame user1
+    """
+    global _SSH_KEY_HASHES
+
+    now   = datetime.now(IST)
+    actor, how = _active_root_actor()
+
+    # ── Hash-based detection: scan all users ────────────────────────
+    try:
+        home_base = "/home"
+        if not os.path.isdir(home_base):
+            return
+        for username in os.listdir(home_base):
+            key_path = os.path.join(home_base, username, ".ssh", "authorized_keys")
+
+            # Deletion detection
+            if key_path in _SSH_KEY_HASHES and not os.path.exists(key_path):
+                real_actor, lateral_target = _get_lateral_actor(username)
+                alert_user = real_actor if lateral_target else (actor if how else username)
+                trigger_alert(
+                    "HIGH", "SSH Authorized Keys Deleted", alert_user,
+                    f"User '{username}' authorized_keys was deleted — "
+                    f"could be evidence wiping after adding a backdoor key. "
+                    f"Attributed to: '{alert_user}'",
+                    env,
+                    extra_facts={
+                        "Account":     username,
+                        "File":        key_path,
+                        "Attributed":  alert_user,
+                        "Lateral via": lateral_target or "n/a",
+                        "Risk":        "Deleting authorized_keys after modification hides backdoor activity",
+                    }
+                )
+                del _SSH_KEY_HASHES[key_path]
+                continue
+
+            if not os.path.exists(key_path):
+                continue
+
+            try:
+                h = hashlib.sha256()
+                with open(key_path, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(8192), b""):
+                        h.update(chunk)
+                current_hash = h.hexdigest()
+            except Exception:
+                continue
+
+            prev_hash = _SSH_KEY_HASHES.get(key_path)
+
+            if prev_hash is None:
+                # First time seeing this file — just baseline it, no alert
+                _SSH_KEY_HASHES[key_path] = current_hash
+                continue
+
+            if current_hash != prev_hash:
+                # File changed — read the current keys for context
+                try:
+                    keys_content = open(key_path, errors="replace").read()
+                    key_count    = len([l for l in keys_content.splitlines()
+                                       if l.strip() and not l.startswith("#")])
+                except Exception:
+                    keys_content = ""
+                    key_count    = 0
+
+                real_actor, lateral_target = _get_lateral_actor(username)
+                # If root has an active session, they're the most likely actor
+                if how and not lateral_target:
+                    alert_user = actor
+                elif lateral_target:
+                    alert_user = real_actor
+                else:
+                    alert_user = username
+
+                trigger_alert(
+                    "CRITICAL", "SSH Authorized Keys Modified", alert_user,
+                    f"authorized_keys for user '{username}' was modified. "
+                    f"Now contains {key_count} key(s). "
+                    f"Attributed to: '{alert_user}'. "
+                    f"An attacker may have added a persistent SSH backdoor.",
+                    env,
+                    extra_facts={
+                        "Account":     username,
+                        "File":        key_path,
+                        "Key count":   str(key_count),
+                        "Attributed":  alert_user,
+                        "Lateral via": lateral_target or "n/a",
+                        "Root active": how or "none",
+                        "Risk":        "Adding SSH keys gives persistent remote access without a password",
+                        "Prev hash":   prev_hash[:16] + "...",
+                        "New hash":    current_hash[:16] + "...",
+                    }
+                )
+                _SSH_KEY_HASHES[key_path] = current_hash
+
+    except Exception:
+        pass
+
+    # ── auditd key=user_ssh_keys (write to /home/) ──────────────────
+    if not os.path.exists(AUDIT_LOG):
+        return
+
+    for rec in _build_audit_records(AUDIT_LOG):
+        if rec.get("key", "") != "user_ssh_keys":
+            continue
+
+        uid  = rec.get("uid", "0")
+        auid = rec.get("auid", "4294967295")
+        try:
+            auid_int = int(auid)
+        except ValueError:
+            auid_int = 4294967295
+
+        if auid_int >= 4294967294 and int(uid) == 0:
+            continue  # pure kernel/system
+
+        uname = uid_to_name(uid)
+        if uname in DELETION_WHITELIST_USERS:
+            continue
+
+        fpath = rec.get("name", "?")
+        # Only care about .ssh/ paths
+        if ".ssh" not in fpath:
+            continue
+
+        user = _resolve_audit_user(rec)
+        base_username = uid_to_name(uid)
+
+        # Figure out whose .ssh this is
+        m_owner = re.search(r"/home/([^/]+)/", fpath)
+        owner   = m_owner.group(1) if m_owner else "unknown"
+
+        real_actor, lateral_target = _get_lateral_actor(base_username)
+        alert_user = real_actor if lateral_target else user
+
+        # If they're writing to their own .ssh, not suspicious from auditd
+        # (hash-based detection above covers the actual content change)
+        if owner == base_username:
+            continue
+
+        trigger_alert(
+            "CRITICAL", "SSH Keys Written To Another User Account", alert_user,
+            f"User '{alert_user}' wrote to '{owner}' SSH directory: {fpath}. "
+            f"This could be planting a backdoor SSH key in another user's account.",
+            env,
+            extra_facts={
+                "Actor":       alert_user,
+                "Target acct": owner,
+                "File":        fpath,
+                "Lateral via": lateral_target or "n/a",
+                "Risk":        "Writing another user's authorized_keys = persistent backdoor",
+            }
+        )
+
+
+# -----------------------------------------------------------------
+# Check: /proc/sysrq-trigger write
+# -----------------------------------------------------------------
+def check_sysrq(env: dict):
+    """
+    Detect writes to /proc/sysrq-trigger via auditd key=sysrq_trigger.
+
+    /proc/sysrq-trigger is a kernel interface that accepts single-char
+    commands with immediate, irreversible effects:
+      'b' = immediate reboot (no sync, no unmount)
+      'o' = immediate power off
+      'f' = trigger OOM killer (kills processes)
+      'i' = kill all processes except init
+      'e' = send SIGTERM to all processes
+      'k' = kill all processes on current terminal
+      'c' = kernel crash / panic (triggers kdump)
+
+    An attacker with root can use this to instantly destroy a server
+    or cover tracks by forcing a reboot that clears memory.
+    This is one of the most destructive single-commands on Linux.
+    """
+    if not os.path.exists(AUDIT_LOG):
+        return
+
+    _SYSRQ_EFFECTS = {
+        "b": "IMMEDIATE REBOOT (no sync/unmount) — data loss likely",
+        "o": "IMMEDIATE POWER OFF",
+        "c": "KERNEL CRASH / PANIC (triggers kdump)",
+        "f": "OOM killer triggered — may kill critical processes",
+        "i": "SIGKILL sent to ALL processes except init",
+        "e": "SIGTERM sent to ALL processes",
+        "k": "Kill all processes on this terminal (SAK)",
+        "m": "Dump memory info to console",
+        "s": "Sync all filesystems",
+        "u": "Remount all filesystems read-only",
+        "9": "Raise oom_score_adj on all tasks",
+    }
+
+    for rec in _build_audit_records(AUDIT_LOG):
+        if rec.get("key", "") != "sysrq_trigger":
+            continue
+
+        uid  = rec.get("uid", "0")
+        auid = rec.get("auid", "4294967295")
+        try:
+            auid_int = int(auid)
+        except ValueError:
+            auid_int = 4294967295
+
+        if auid_int >= 4294967294 and int(uid) == 0:
+            continue
+
+        user = _resolve_audit_user(rec)
+        actor, how = _active_root_actor()
+        base_username = uid_to_name(uid)
+        real_actor, lateral_target = _get_lateral_actor(base_username)
+        alert_user = real_actor if lateral_target else (actor if how else user)
+
+        # Try to get the character written from the cmd/args
+        cmd = rec.get("cmd", "")
+        sysrq_char = ""
+        m_char = re.search(r"(?:echo|printf)\s+['\"]?([a-z0-9])['\"]?", cmd, re.IGNORECASE)
+        if m_char:
+            sysrq_char = m_char.group(1).lower()
+        effect = _SYSRQ_EFFECTS.get(sysrq_char, "Unknown sysrq command")
+
+        trigger_alert(
+            "CRITICAL", "SysRq Trigger Write Detected", alert_user,
+            f"User '{alert_user}' wrote to /proc/sysrq-trigger. "
+            f"Command: '{sysrq_char or '?'}' — Effect: {effect}. "
+            f"This can instantly reboot, crash, or destroy the server.",
+            env,
+            extra_facts={
+                "User":        alert_user,
+                "SysRq char":  sysrq_char or "unknown",
+                "Effect":      effect,
+                "Command":     cmd[:200],
+                "Lateral via": lateral_target or "n/a",
+                "Root via":    how or "direct",
+                "Risk":        "Instant irreversible kernel-level action — reboot/crash/kill all",
+            }
+        )
+
+
+# -----------------------------------------------------------------
+# Check: su failures (wrong password on su to another user)
+# -----------------------------------------------------------------
+
+# Track per-target su failure counts: {actor -> {target -> [timestamps]}}
+_SU_FAILURES: dict = defaultdict(lambda: defaultdict(list))
+
+def check_su_failures(env: dict):
+    """
+    Detect repeated failed `su` attempts (wrong password) for local accounts.
+    This is separate from sudo failures and SSH brute-force.
+
+    Scenarios caught:
+    - User trying to su to root without knowing the root password
+    - User trying to su to another user account (brute force local pivot)
+    - Attacker with a shell trying to escalate laterally
+
+    auth.log patterns:
+      su: FAILED su for root by naveen
+      su: pam_unix(su:auth): authentication failure; ... user=naveen ruser=ubuntu
+    """
+    lines = get_cycle_lines(AUTH_LOGS)
+    now   = datetime.now(IST)
+
+    for line in lines:
+        # Pattern 1: "FAILED su for <target> by <actor>"
+        m1 = re.search(
+            r"su:\s+FAILED su for (\S+) by (\S+)", line, re.IGNORECASE)
+        # Pattern 2: PAM auth failure with ruser
+        m2 = re.search(
+            r"pam_unix\(su[^)]*\):.*authentication failure.*user=(\S+).*ruser=(\S+)",
+            line, re.IGNORECASE)
+        # Pattern 3: su authentication failure (Debian/Ubuntu format)
+        m3 = re.search(
+            r"su\[.*\]:.*authentication failure.*user=(\S+)", line, re.IGNORECASE)
+
+        if m1:
+            target, actor = m1.group(1), m1.group(2)
+        elif m2:
+            target, actor = m2.group(1), m2.group(2)
+        elif m3:
+            target = m3.group(1)
+            actor  = "unknown"
+        else:
+            continue
+
+        target = target.strip("()")
+        actor  = actor.strip("()")
+
+        _SU_FAILURES[actor][target].append(now)
+        # Prune old entries
+        _SU_FAILURES[actor][target] = [
+            t for t in _SU_FAILURES[actor][target]
+            if (now - t) <= BRUTE_FORCE_WINDOW
+        ]
+
+        count = len(_SU_FAILURES[actor][target])
+
+        # Alert threshold: 3+ failures within the window
+        if count >= 3:
+            hour      = int(now.strftime("%H"))
+            off_hours = hour < 6 or hour > 22
+            severity  = "HIGH" if (target == "root" or off_hours) else "MEDIUM"
+            trigger_alert(
+                severity,
+                "Repeated su Authentication Failures",
+                actor,
+                f"User '{actor}' failed to su to '{target}' {count} times "
+                f"in {BRUTE_FORCE_WINDOW} — possible local privilege escalation attempt.",
+                env,
+                extra_facts={
+                    "Actor":      actor,
+                    "Target":     target,
+                    "Failures":   str(count),
+                    "Window":     str(BRUTE_FORCE_WINDOW),
+                    "Off-hours":  str(off_hours),
+                    "Risk":       "Repeated su failures indicate local password brute-force or lateral pivot attempt",
+                }
+            )
+
+
+# -----------------------------------------------------------------
+# Check: home directory snooping (user reading another user's files)
+# -----------------------------------------------------------------
+
+# Track who accessed whose home dir this cycle: (actor, owner) -> count
+_HOME_SNOOP_SEEN: dict = {}
+
+def check_home_dir_snooping(env: dict):
+    """
+    Detect when a user accesses another user's home directory.
+
+    The classic insider threat: an employee with a shell reads
+    /home/finance_user/documents/ or /home/admin/.bash_history
+    looking for credentials, sensitive data, or private info.
+
+    Uses auditd key=home_dir_access (openat syscall on /home/).
+    Only alerts when actor != file owner (reading your OWN dir is fine).
+    Deduplicates: one alert per (actor, victim) pair per cooldown period.
+
+    Whitelist: root/system processes are excluded. Only uid >= 1000.
+    """
+    if not os.path.exists(AUDIT_LOG):
+        return
+
+    now = datetime.now(IST)
+    # Purge old seen entries (use 30-min TTL same as MEDIUM cooldown)
+    snoop_ttl = timedelta(minutes=30)
+    for key in list(_HOME_SNOOP_SEEN.keys()):
+        if (now - _HOME_SNOOP_SEEN[key]["ts"]) > snoop_ttl:
+            del _HOME_SNOOP_SEEN[key]
+
+    for rec in _build_audit_records(AUDIT_LOG):
+        if rec.get("key", "") != "home_dir_access":
+            continue
+
+        uid  = rec.get("uid", "0")
+        auid = rec.get("auid", "4294967295")
+
+        try:
+            uid_int  = int(uid)
+            auid_int = int(auid)
+        except ValueError:
+            continue
+
+        # Only real logged-in users (uid >= 1000, auid set)
+        if uid_int < 1000 or auid_int >= 4294967294:
+            continue
+
+        fpath = rec.get("name", "")
+        if not fpath or "/home/" not in fpath:
+            continue
+
+        # Extract the home dir owner from the path
+        m_owner = re.search(r"/home/([^/]+)/", fpath)
+        if not m_owner:
+            continue
+        home_owner = m_owner.group(1)
+
+        actor = uid_to_name(uid)
+
+        # Skip if user is accessing their OWN home directory
+        if actor == home_owner:
+            continue
+
+        # Skip system/service accounts
+        if actor in DELETION_WHITELIST_USERS:
+            continue
+
+        # Check lateral attribution
+        real_actor, lateral_target = _get_lateral_actor(actor)
+        alert_user = real_actor if lateral_target else actor
+
+        # Dedup: one alert per (actor, victim) pair per snoop_ttl
+        snoop_key = f"{alert_user}:{home_owner}"
+        if snoop_key in _HOME_SNOOP_SEEN:
+            _HOME_SNOOP_SEEN[snoop_key]["count"] += 1
+            continue
+        _HOME_SNOOP_SEEN[snoop_key] = {"ts": now, "count": 1}
+
+        hour      = int(now.strftime("%H"))
+        off_hours = hour < 6 or hour > 22
+        severity  = "HIGH" if off_hours else "MEDIUM"
+
+        # Escalate if accessing sensitive sub-paths
+        sensitive_paths = (".ssh", ".bash_history", ".gnupg", "password", "secret", "private")
+        if any(sp in fpath.lower() for sp in sensitive_paths):
+            severity = "HIGH"
+
+        trigger_alert(
+            severity, "Home Directory Snooping", alert_user,
+            f"User '{alert_user}' accessed '{home_owner}' home directory: {fpath}. "
+            f"This could indicate credential harvesting or insider data theft.",
+            env,
+            extra_facts={
+                "Actor":        alert_user,
+                "Victim":       home_owner,
+                "File":         fpath,
+                "Off-hours":    str(off_hours),
+                "Lateral via":  lateral_target or "n/a",
+                "Risk":         "Reading another user's home may indicate credential theft or espionage",
+            }
+        )
+
+
+# -----------------------------------------------------------------
 # Main loop
 # -----------------------------------------------------------------
 def main():
@@ -1649,15 +2528,22 @@ def main():
 
         check_log_tampering(env)
         check_su_sudo(env)
+        check_su_failures(env)
         check_ssh_bruteforce(env)
         check_auditd_commands(env)
         check_auditd_deletions(env)
+        check_auditd_sensitive_files(env)
+        check_user_ssh_keys(env)
         check_user_group_changes(env)
         check_proc_scanner(env)
+        check_suspicious_exec_paths(env)
         check_kernel_modules(env)
         check_network_connections(env)
         check_file_integrity(env)
+        check_sysrq(env)
         check_insider_evasion(env)
+        check_data_exfiltration(env)
+        check_home_dir_snooping(env)
         check_dormant_accounts(env)
         check_threat_scores(env)
 
